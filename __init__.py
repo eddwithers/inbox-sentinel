@@ -306,10 +306,20 @@ def _cfg(ctx, key, default):
 
 # ---------------------------------------------------------------- lifecycle
 
+_WATCHER_LOCK = threading.Lock()
+
+
 def _ensure_watcher(ctx):
     """Start the poll loop once per profile, on the host's supervised tasks."""
     if not _cfg(ctx, "enabled", True):
         return
+    # In process, turns for one profile can run on different threads at once.
+    # Serialise check-and-spawn so two of them cannot both start a watcher.
+    with _WATCHER_LOCK:
+        _ensure_watcher_locked(ctx)
+
+
+def _ensure_watcher_locked(ctx):
     key = ctx.profile_name
     task = _WATCHERS.get(key)
     if task is not None and not task.done():

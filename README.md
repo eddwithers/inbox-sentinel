@@ -18,6 +18,11 @@ Two mail backends, pick whichever fits your account:
 | `gmail` *(default)* | Google Cloud OAuth client + one `hermes auth add` | Gmail users — polls history deltas every 15 seconds by default, then classifies and can draft a reply |
 | `imap` | Host, user, and password/app password in the masked settings UI when available | Servers that accept password or app-password login over TLS, including Gmail with an [app password](https://myaccount.google.com/apppasswords) |
 
+The IMAP backend is **experimental**: it is tested against a scripted local TLS
+server, not yet against a real provider. Some servers report message sizes that
+differ from what they send; this version skips such messages with a warning.
+Keep your normal notifications on while you try it.
+
 Both run the same pipeline — local noise filter → importance gate → draft reply → delivery.
 Set `provider: imap` and the `imap_*` fields; the Gmail OAuth step is skipped
 entirely.

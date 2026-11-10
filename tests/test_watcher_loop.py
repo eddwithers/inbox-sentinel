@@ -95,3 +95,39 @@ def test_plugin_host_path_still_uses_spawn_task_directly(plugin, ctx, monkeypatc
 
     asyncio.run(one_turn())
     assert calls == [threading.current_thread().name]  # called in place, not on the runner
+
+
+def test_simultaneous_turns_start_exactly_one_watcher(plugin, ctx, monkeypatch):
+    spawned = []
+
+    async def fake_loop(_ctx):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(plugin, "_watch_loop", fake_loop)
+    ctx.config["enabled"] = True
+
+    class Live(_RealSpawnCtx):
+        def spawn_task(self, coro, name=None):
+            task = asyncio.get_running_loop().create_task(coro, name=name)
+            spawned.append(task)
+            return task
+
+    live = Live(ctx)
+    turns = 6
+    barrier = threading.Barrier(turns)
+
+    def turn():
+        async def go():
+            barrier.wait()
+            plugin._ensure_watcher(live)
+        asyncio.run(go())
+
+    threads = [threading.Thread(target=turn) for _ in range(turns)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    try:
+        assert len(spawned) == 1
+    finally:
+        plugin._stop_watcher(ctx)
