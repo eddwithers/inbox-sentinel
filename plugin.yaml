@@ -1,0 +1,151 @@
+name: inbox-sentinel
+version: 0.1.0
+author: Edd Withers
+description: >-
+  Watches Gmail or IMAP inboxes and surfaces messages that matter. Can
+  draft replies when appropriate. Best with the new Hermes app by Nous
+  Research, currently in beta; other `hermes send` targets still work.
+license: MIT
+homepage: https://github.com/eddwithers/inbox-sentinel
+tags: [email, gmail, imap, push, notifications, mobile]
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.23.0"
+
+provides_tools:
+  - inbox_sentinel_status
+  - inbox_sentinel_test
+  - inbox_sentinel_feedback
+
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+
+optional_env:
+  - name: INBOX_SENTINEL_CLIENT_ID
+    description: Google Cloud OAuth client ID (Desktop app type) for Gmail access
+  - name: INBOX_SENTINEL_CLIENT_SECRET
+    description: Google Cloud OAuth client secret for Gmail access
+    secret: true
+
+oauth:
+  - id: gmail
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/gmail.readonly
+    client_id_env: INBOX_SENTINEL_CLIENT_ID
+    client_secret_env: INBOX_SENTINEL_CLIENT_SECRET
+    hosts: [gmail.googleapis.com]
+    authorize_params: {access_type: offline, prompt: consent}
+
+python_dependencies: []
+
+config_schema:
+  client_id:
+    type: secret
+    env: INBOX_SENTINEL_CLIENT_ID
+    label: Google OAuth client ID
+    description: >-
+      From your Google Cloud "Desktop app" OAuth client; enter it in the
+      masked host UI when available
+  client_secret:
+    type: secret
+    env: INBOX_SENTINEL_CLIENT_SECRET
+    label: Google OAuth client secret
+    description: The client secret for the same Google Cloud OAuth client
+  enabled:
+    type: bool
+    default: true
+    description: Run the inbox watcher (enable after reviewing provider, model and delivery settings)
+  provider:
+    type: str
+    default: gmail
+    choices: [gmail, imap]
+    description: >-
+      Mail backend. "gmail" uses Gmail history polling over OAuth.
+      "imap" is for servers that accept username/password or app-password
+      login over TLS; fill host, user, and password in the masked settings
+      UI when available.
+  gmail_query:
+    type: str
+    default: ""
+    description: Optional Gmail search scope; nonmatching messages are excluded before header/body/model access
+  imap_host:
+    type: str
+    default: ""
+    description: IMAP server hostname (provider=imap)
+  imap_port:
+    type: int
+    default: 993
+    description: IMAP server port (993 = IMAPS; plaintext only on literal loopback IPs for tests)
+  imap_ssl:
+    type: bool
+    default: true
+    description: >-
+      Use IMAPS (TLS). STARTTLS-only and remote plaintext configurations are
+      unsupported.
+  imap_user:
+    type: str
+    default: ""
+    description: IMAP username / full email address
+  imap_password:
+    type: secret
+    env: INBOX_SENTINEL_IMAP_PASSWORD
+    label: IMAP password
+    description: >-
+      IMAP password or app password. For Gmail-over-IMAP, use a Google app
+      password. Store it in the profile secret field, never in chat.
+  imap_folder:
+    type: str
+    default: INBOX
+    description: IMAP folder (mailbox) to watch
+  poll_interval_seconds:
+    type: int
+    default: 15
+    description: Seconds between Gmail or IMAP polls
+  delivery_target:
+    type: str
+    default: push
+    description: >-
+      Where alerts go — any `hermes send` target. "push" pings the Hermes
+      mobile beta; "none" disables delivery. Live session injection is not supported. Other values name a platform
+      target like "telegram" or "discord:#ops".
+  importance_profile:
+    type: str
+    default: ""
+    description: >-
+      Plain-language description of what matters to you (fed to the
+      importance gate). Empty = sensible generic default.
+  draft_replies:
+    type: bool
+    default: true
+    description: Pre-draft a reply for important mail
+  daily_gate_cap:
+    type: int
+    default: 100
+    description: Maximum classification attempts per day (0-1000); pending mail defers when exhausted
+  daily_draft_cap:
+    type: int
+    default: 15
+    description: Max drafted replies per day (spend guardrail)
+  draft_max_tokens:
+    type: int
+    default: 700
+    description: Max tokens per drafted reply
+  quiet_labels:
+    type: list
+    default: [CATEGORY_PROMOTIONS, CATEGORY_SOCIAL]
+    description: Gmail labels treated as noise before any model call
+  keyword_overrides:
+    type: list
+    default: [appointment, invoice, payment, statement, parcel, booking, urgent, school, medical, flight, delivery]
+    description: Subject keywords that override the quiet labels
+  skip_recipient_keywords:
+    type: list
+    default: []
+    description: Skip mail addressed to these recipient substrings (e.g. old aliases)
+  hermes_send_path:
+    type: str
+    default: ""
+    description: Path to the hermes binary if not on PATH

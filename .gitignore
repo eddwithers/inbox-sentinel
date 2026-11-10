@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+auth.json
+*.pem
+*.key
+*.p12
+.venv/
+venv/
+.DS_Store
