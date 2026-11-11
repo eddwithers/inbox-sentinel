@@ -21,6 +21,7 @@ from email import policy
 from email.parser import BytesParser
 from email.feedparser import BytesFeedParser
 from email.utils import getaddresses
+from html.parser import HTMLParser
 import unicodedata
 from urllib.parse import quote
 
@@ -311,7 +312,7 @@ _WATCHER_LOCK = threading.Lock()
 
 def _ensure_watcher(ctx):
     """Start the poll loop once per profile, on the host's supervised tasks."""
-    if not _cfg(ctx, "enabled", True):
+    if not _cfg(ctx, "enabled", False):
         return
     # In process, turns for one profile can run on different threads at once.
     # Serialise check-and-spawn so two of them cannot both start a watcher.
@@ -424,12 +425,56 @@ def _bootstrap(ctx):
                 profile["historyId"], len(seen))
 
 
+HTML_STRIP_LIMIT = 20000     # only ~4k chars are used downstream; bound hostile input
+
+
+class _HTMLTextParser(HTMLParser):
+    """Linear-time HTML to text: drops script/style blocks and all tags, keeps text.
+
+    An unclosed <script>/<style> leaves the parser in skip mode, suppressing the
+    remainder — a crafted body loses at most HTML_STRIP_LIMIT characters of
+    scan work, never a quadratic rescans. stdlib HTMLParser never raises on
+    malformed input and does one pass over the fed text.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._chunks = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip_depth += 1
+        elif tag == "br":
+            self._chunks.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "br":
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            if self._skip_depth:
+                self._skip_depth -= 1
+        elif tag == "p":
+            self._chunks.append("\n\n")
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self._chunks.append(data)
+
+    def text(self):
+        return re.sub(r"\n{3,}", "\n\n", "".join(self._chunks)).strip()
+
+
 def _strip_html(html):
-    html = re.sub(r"<style.*?</style>|<script.*?</script>", "", html, flags=re.S | re.I)
-    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-    html = re.sub(r"</p>", "\n\n", html, flags=re.I)
-    text = re.sub(r"<[^>]+>", "", html)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    # Truncate BEFORE any scanning: a crafted 256 KB body must not drive parse
+    # cost (only ~4k chars are used downstream). The old regex strip rescanned
+    # per unclosed <style> — quadratic; see the timing test in test_security.
+    parser = _HTMLTextParser()
+    parser.feed(str(html)[:HTML_STRIP_LIMIT])
+    parser.close()
+    return parser.text()
 
 
 def _extract_message_content(parsed):
@@ -759,7 +804,7 @@ async def _watch_loop(ctx):
     state.set("started_at", time.time())
     state.set("last_error", None)
     errors = 0
-    while _cfg(ctx, "enabled", True):
+    while _cfg(ctx, "enabled", False):
         interval = max(5, min(3600, int(_cfg(ctx, "poll_interval_seconds", 15))))
         try:
             await _tick(ctx)
@@ -786,11 +831,11 @@ async def _watch_loop(ctx):
             if errors >= FAILURE_NOTICE_AFTER:
                 await _health_notice(ctx, "repeated_failure", count=errors,
                                      error=type(exc).__name__)
-        if not _cfg(ctx, "enabled", True):
+        if not _cfg(ctx, "enabled", False):
             break
         interval = min(interval, 3600)
         for _ in range((interval + 4) // 5):
-            if not _cfg(ctx, "enabled", True):
+            if not _cfg(ctx, "enabled", False):
                 break
             await asyncio.sleep(min(5, interval))
 
@@ -940,14 +985,14 @@ async def _tick_gmail(ctx):
 def _status(ctx):
     state = ctx.state
     task = _WATCHERS.get(ctx.profile_name)
-    running = bool(task and not task.done()) and _cfg(ctx, "enabled", True)
+    running = bool(task and not task.done()) and _cfg(ctx, "enabled", False)
     day = time.strftime("%Y-%m-%d")
     return {
         "gate_calls_today": state.get("gate_count", 0) if state.get("gate_day") == day else 0,
         "daily_gate_cap": max(0, min(1000, int(_cfg(ctx, "daily_gate_cap", 100)))),
         "running": running,
         "profile": ctx.profile_name,
-        "enabled": _cfg(ctx, "enabled", True),
+        "enabled": _cfg(ctx, "enabled", False),
         "delivery_target": _cfg(ctx, "delivery_target", "push"),
         "poll_interval_seconds": _cfg(ctx, "poll_interval_seconds", 15),
         "last_poll": state.get("last_poll"),

@@ -56,8 +56,8 @@ config_schema:
     description: The client secret for the same Google Cloud OAuth client
   enabled:
     type: bool
-    default: true
-    description: Run the inbox watcher (enable after reviewing provider, model and delivery settings)
+    default: false
+    description: Run the inbox watcher — turn on after completing provider, model and delivery setup
   provider:
     type: str
     default: gmail

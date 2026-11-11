@@ -249,3 +249,29 @@ def test_sample_tool_cannot_send_from_agent_call(plugin, ctx):
     assert json.loads(result)['ok'] is False
     assert not ctx.injected_messages
     assert not ctx.llm.structured_calls
+
+
+def test_hostile_unclosed_style_stays_linear(plugin):
+    """~250 KB of repeated unclosed <style> must not stall the gateway.
+
+    The old regex strip rescanned per occurrence over the full body
+    (quadratic): 252 KB took ~28s while holding the GIL. Truncate-then-parse
+    makes one linear pass; this generous bound only fails on a regression.
+    """
+    import time as _time
+    hostile = '<style>' * 35000 + '<p>Hello</p>'   # ~252 KB, never closed
+    start = _time.monotonic()
+    body = plugin._strip_html(hostile)
+    elapsed = _time.monotonic() - start
+    assert elapsed < 2.0, f'HTML strip took {elapsed:.1f}s — quadratic regression'
+    # The truncation point falls inside the unclosed style block, so the
+    # parser stays in skip mode: no tag soup survives, nothing is invented.
+    assert body == ''
+
+
+def test_strip_html_keeps_text_and_drops_tags_linearly(plugin):
+    body = plugin._strip_html(
+        '<STYLE>x{}</STYLE><p>Hello <b>world</b></p>'
+        '<script>alert(1)</script><br/>Bye &amp; co')
+    assert 'Hello' in body and 'world' in body and 'Bye & co' in body
+    assert '<' not in body and 'alert' not in body and 'x{}' not in body

@@ -156,7 +156,7 @@ labels, archives or deletes your mail.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Run the watcher |
+| `enabled` | `false` | Run the watcher (turn on after setup) |
 | `provider` | `gmail` | `gmail` (OAuth history API) or `imap` (generic poll) |
 | `gmail_query` | *(empty)* | Optional Gmail search scope checked before message metadata/body/model access; use a narrow label or subject query |
 | `imap_host` | *(empty)* | IMAP server hostname (provider=imap) |
