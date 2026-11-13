@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/media/icon.png" width="160" alt="Inbox Sentinel logo" /></p>
+
 # Inbox Sentinel
 
 **Inbox Sentinel surfaces email that matters in your Hermes workflow.**
