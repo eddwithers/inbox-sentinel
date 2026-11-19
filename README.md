@@ -25,7 +25,7 @@ server, not yet against a real provider. Some servers report message sizes that
 differ from what they send; this version skips such messages with a warning.
 Keep your normal notifications on while you try it.
 
-Both run the same pipeline — local noise filter → importance gate → draft reply → delivery.
+Both run the same pipeline — local noise filter → deterministic scam check → importance gate → draft reply → delivery.
 Set `provider: imap` and the `imap_*` fields; the Gmail OAuth step is skipped
 entirely.
 
@@ -40,6 +40,10 @@ entirely.
   uses the configured poll interval.
 - **Local noise filtering.** Promotions and social labels are skipped locally before
   any model call.
+- **Scam warnings.** A deterministic, zero-model-cost check flags classic lure
+  shapes (password-protected PDF attachments, undisclosed recipients) before the
+  gate. A hit arrives as a POSSIBLE SCAM alert with the real summary, never a
+  draft reply — see [Scam warnings](#scam-warnings).
 - **An importance gate with taste.** What survives the local filter is classified by the
   model you already run — tuned by a plain-language description of *your* priorities.
 - **Replies drafted for review.** Important messages can arrive with a first-person
@@ -140,7 +144,7 @@ Corrections live in your profile's plugin state, capped and tidy, and the counts
 ## How it works
 
 ```
-Gmail history API or IMAP poll ──▶ local noise filter ──▶ LLM importance gate ──▶ your alerts
+Gmail history API or IMAP poll ──▶ local noise filter ──▶ scam-signal check ──▶ LLM importance gate ──▶ your alerts
 ```
 
 | Surface | Used for |
@@ -208,6 +212,37 @@ This is a deterministic pre-model guard, not just a prompt instruction. It is
 conservative: an attached signature image or an incidental attachment mention can
 also withhold a draft. Body-only messages can still receive draft suggestions;
 all suggestions require human review and are never sent automatically.
+
+### Scam warnings
+
+Some mail is shaped like a lure rather than a message: an order confirmation
+whose "invoice" is a password-protected PDF (the password exists to defeat mail
+scanners, not to protect you), or a mass mailing addressed to
+`undisclosed-recipients:;`. A deterministic substring check runs on the subject,
+body and recipient headers before any model call, at zero model cost.
+
+On a hit the alert is re-labelled, not suppressed:
+
+- **POSSIBLE SCAM** header with explicit guidance: do not open attachments, do
+  not enter any PDF password, do not reply.
+- The signals are named, and the real summary is included so you can judge.
+- **No reply is ever drafted** to a suspected scammer.
+- The mail is left untouched in your inbox for inspection or deletion — the
+  plugin is read-only and takes no archive, label or report action.
+- The warning outranks the importance gate: even a model verdict of NOISE still
+  delivers the warning, and if the model is unavailable or over budget the
+  alert still goes out with an untrusted opening excerpt instead of a summary.
+
+Passing SPF/DKIM/DMARC does **not** clear a signal: business-email-compromise
+lures are sent from real, compromised company mailboxes and authenticate
+cleanly. False positives are expected and accepted — a legitimate bank
+statement with a password-protected PDF will trigger the warning; over-warn
+rather than under-warn, and read the summary before deciding.
+
+Limits: the patterns are literal substrings (a hyphenated "password-protected"
+without the spaced form elsewhere does not match), only the first 4,000
+characters of body are scanned, and this is a heuristic for two known lure
+shapes — not a general phishing detector or a guarantee of safety.
 
 ### Runtime verification
 
