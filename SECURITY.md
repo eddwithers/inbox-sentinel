@@ -92,6 +92,22 @@ under their policies. Plugin logs omit message subjects, sender addresses and ra
 provider error bodies in the hardened paths. Hermes/provider logging has its own
 policy. There is no plugin telemetry.
 
+## Scam signals
+
+A deterministic substring check (password-protected PDF attachment;
+`undisclosed-recipients:;`) runs on subject, body and recipient headers before
+the importance gate, at zero model cost. A hit forces a POSSIBLE SCAM warning
+alert regardless of the model verdict — including when the gate is unavailable
+or over budget — names the signals, includes the summary or an untrusted body
+excerpt, and never drafts a reply. Authentication results are not scam evidence
+and never clear a hit: compromised legitimate mailboxes pass SPF/DKIM/DMARC.
+The check is pure detection, separate from alert shaping; the read-only contract
+means a hit triggers no archive, label, report or delete action. It is a
+heuristic for two known lure shapes with literal-substring and 4,000-character
+body limits, not a general phishing detector. False positives (e.g. legitimate
+password-protected bank statements) are expected; the warning re-labels mail,
+it never suppresses it.
+
 ## Release checks
 
 Require fictional adversarial regression tests, canonical Hermes test runner,

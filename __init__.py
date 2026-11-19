@@ -522,6 +522,57 @@ def _fetch_body(mid):
     return _fetch_content(mid)["body"]
 
 
+# Deterministic scam signals, ported from the production push watcher after a
+# fake order-confirmation lure (password-protected PDF) passed as a clean
+# alert. Zero model cost; checked before the importance gate. A hit re-labels
+# the alert, never suppresses the mail: over-warn rather than under-warn, and
+# keep the real summary so the user can judge. Auth results are NOT scam
+# evidence — the original lure passed SPF/DKIM/DMARC because it came from the
+# real company's own compromised mailbox, so nothing here consults them.
+# Signals stay pure (no ctx, no alert shaping) so routing can evolve
+# independently of detection.
+SCAM_SIGNALS = [
+    ("password-protected attachment", "password protected", "pdf"),
+    ("undisclosed recipients", "undisclosed-recipients", None),
+]
+
+
+def scam_signal_hits(subject, body, recipient):
+    """Return human-readable scam-signal names for this mail (pure check)."""
+    text = f"{subject}\n{body}\n{recipient}".lower()
+    hits = []
+    for name, first, second in SCAM_SIGNALS:
+        if first in text and (second is None or second in text):
+            hits.append(name)
+    return hits
+
+
+def _scam_alert_text(*, subject, sender, hits, summary="", body="",
+                     mid_prefix=None, mid=None):
+    """Shape the scam warning. Pure string building; routing stays with the
+    caller. Untrusted fields go through _safe_text like every other alert."""
+    lines = [
+        "POSSIBLE SCAM — do not open attachments, do not enter any PDF password, do not reply.",
+        "",
+        f"Subject: {_safe_text(subject, 300)}",
+        f"From: {_safe_text(sender, 300)}",
+        f"Time: {time.strftime('%H:%M')}",
+        "",
+    ]
+    if summary:
+        lines += [_safe_text(summary), ""]
+    elif body.strip():
+        lines += ["Opening excerpt (untrusted):", _safe_text(body, 300), ""]
+    lines += [
+        "Scam signals detected: " + "; ".join(hits) + ".",
+        "Auth checks can pass on these: a real company's mailbox may be compromised.",
+        "No reply drafted. The mail is left in your inbox untouched for inspection or deletion.",
+    ]
+    if mid_prefix and mid is not None:
+        lines += ["", f"msgid: {mid_prefix}:{mid}"]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- pipeline
 
 async def _process(ctx, mid):
@@ -625,17 +676,30 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
     if draft_blocker:
         gate_input += f"\n\n[Reader limitation: {draft_blocker} {context_note}]"
-    _reserve_gate(ctx)
-    gate = await ctx.llm.acomplete_structured(
-        instructions=_gate_instructions(ctx),
-        input=[{"type": "text", "text": gate_input}],
-        json_schema=GATE_SCHEMA,
-        schema_name="sentinel.gate",
-        purpose=GATE_PURPOSE,
-        task=GATE_TASK,
-        temperature=0.0,
-        max_tokens=200,
-    )
+    scam_hits = scam_signal_hits(subject, body, recipient)
+    if scam_hits:
+        # Deterministic signals outrank the gate: warn even if the model would
+        # call this noise, and never draft a reply to a suspected scammer. The
+        # gate is consulted only for a summary; if it is unavailable (budget,
+        # outage, bad output) the warning still goes out. No archive or other
+        # mailbox action — the plugin is read-only and the mail stays for inspection.
+        logger.info("scam signals detected: %s", "; ".join(scam_hits))
+        summary = ""
+        try:
+            gate = await _gate_call(ctx, gate_input)
+            parsed = _validated_gate(gate)
+            if parsed is not None:
+                summary = parsed.get("summary", "")
+        except Exception as exc:
+            logger.warning("scam summary unavailable (%s) — sending deterministic warning",
+                           type(exc).__name__)
+        await _deliver(ctx, _scam_alert_text(
+            subject=subject, sender=sender, hits=scam_hits, summary=summary,
+            body=body, mid_prefix=mid_prefix, mid=mid))
+        _bump_alerts_sent(ctx)
+        logger.info("scam alert delivery completed")
+        return
+    gate = await _gate_call(ctx, gate_input)
     parsed = _validated_gate(gate)
     if parsed is None:
         logger.warning("gate returned unparseable output for %s — treating as noise", mid)
@@ -666,14 +730,7 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
         lines += ["No reply drafted — draft generation unavailable or disabled; review the email."]
     lines += ["", f"msgid: {mid_prefix}:{mid}"]
     await _deliver(ctx, "\n".join(lines))
-    # Delivery succeeded. Bump the alerts_sent counter defensively — a failure
-    # here (quota, concurrent write) must NOT propagate: that would make the
-    # outer tick retry the whole message and re-deliver the alert.
-    try:
-        state = ctx.state
-        state.set("alerts_sent", state.get("alerts_sent", 0) + 1)
-    except Exception as exc:
-        logger.warning("alerts_sent update failed (%s)", type(exc).__name__)
+    _bump_alerts_sent(ctx)
     logger.info("alert delivery completed")
 
 
@@ -699,6 +756,34 @@ def _gate_instructions(ctx):
         instructions += ("\nThis user's past corrections (respect these):\n- "
                          + "\n- ".join(valid_notes))
     return instructions
+
+
+async def _gate_call(ctx, gate_input):
+    """One bounded importance-gate call (verdict + summary). Raises
+    GateBudgetExhausted when the daily cap is spent; callers decide whether
+    that defers the message (normal mail) or not (scam warnings)."""
+    _reserve_gate(ctx)
+    return await ctx.llm.acomplete_structured(
+        instructions=_gate_instructions(ctx),
+        input=[{"type": "text", "text": gate_input}],
+        json_schema=GATE_SCHEMA,
+        schema_name="sentinel.gate",
+        purpose=GATE_PURPOSE,
+        task=GATE_TASK,
+        temperature=0.0,
+        max_tokens=200,
+    )
+
+
+def _bump_alerts_sent(ctx):
+    # Delivery succeeded. A counter failure (quota, concurrent write) must NOT
+    # propagate: that would make the outer tick retry the whole message and
+    # re-deliver the alert.
+    try:
+        state = ctx.state
+        state.set("alerts_sent", state.get("alerts_sent", 0) + 1)
+    except Exception as exc:
+        logger.warning("alerts_sent update failed (%s)", type(exc).__name__)
 
 
 def _draft_blocker(subject, body, *, attachments=None, body_truncated=False):
@@ -1069,19 +1154,26 @@ async def _test(ctx, args):
     subject = str(args.get("subject", "Test message"))[:300]
     body = str(args.get("body", ""))[:MAX_MESSAGE_BYTES]
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
+    scam_hits = scam_signal_hits(subject, body, "")
 
-    _reserve_gate(ctx)
-    gate = await ctx.llm.acomplete_structured(
-        instructions=_gate_instructions(ctx),
-        input=[{"type": "text", "text": gate_input}],
-        json_schema=GATE_SCHEMA,
-        schema_name="sentinel.gate",
-        purpose=GATE_PURPOSE,
-        task=GATE_TASK,
-        temperature=0.0,
-        max_tokens=200,
-    )
-    parsed = _validated_gate(gate)
+    parsed = None
+    try:
+        gate = await _gate_call(ctx, gate_input)
+        parsed = _validated_gate(gate)
+    except GateBudgetExhausted:
+        if not scam_hits:
+            raise
+        logger.warning("gate budget exhausted — deterministic scam warning for sample")
+    if scam_hits:
+        summary = _safe_text(parsed["summary"]) if parsed else ""
+        out = {"verdict": "IMPORTANT", "summary": summary, "scam_signals": scam_hits,
+               "suggested_reply": None,
+               "draft_withheld_reason": "Possible scam — never draft a reply to a suspected scammer."}
+        if args.get("deliver"):
+            await _deliver(ctx, _scam_alert_text(
+                subject=subject, sender=sender, hits=scam_hits, summary=summary, body=body))
+            out["delivered"] = True
+        return out
     if parsed is None:
         return {"verdict": "NOISE", "summary": "Invalid model output rejected"}
     verdict = parsed["verdict"]
