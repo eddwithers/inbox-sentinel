@@ -178,6 +178,8 @@ labels, archives or deletes your mail.
 | `daily_gate_cap` | `100` | Classification attempts/day (0–1000); pending mail defers at the limit |
 | `daily_draft_cap` | `15` | Draft attempts/day, including failures |
 | `module_scamshield_enabled` | `true` | IS-ScamShield module — deterministic pre-gate scam warnings |
+| `module_noisefilter_enabled` | `true` | IS-NoiseFilter module — local zero-cost noise drops |
+| `module_senderlearning_enabled` | `true` | IS-SenderLearning module — learned exact-sender rules |
 | `quiet_labels` | promotions, social | Gmail labels skipped before any model call (ignored for IMAP) |
 | `keyword_overrides` | appointment, invoice, ... | Subject words that override the quiet labels |
 | `skip_recipient_keywords` | *(empty)* | Recipient substrings to ignore (old aliases) |

@@ -140,6 +140,18 @@ config_schema:
       IS-ScamShield module — deterministic pre-gate scam-signal warnings
       (password-protected PDF lures, undisclosed recipients). Never drafts
       replies to flagged mail; over-warns by design.
+  module_noisefilter_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-NoiseFilter module — local zero-model-cost drops (recipient aliases,
+      quiet labels without a keyword override)
+  module_senderlearning_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-SenderLearning module — learned exact-sender rules (always-noise
+      drops, always-important rescue and gate override)
   quiet_labels:
     type: list
     default: [CATEGORY_PROMOTIONS, CATEGORY_SOCIAL]
