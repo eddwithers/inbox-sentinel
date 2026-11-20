@@ -37,24 +37,24 @@ def _scam_mail(gmail, mid="mScam"):
 # ---------------------------------------------------------------- pure signals
 
 def test_password_protected_pdf_hits(plugin):
-    hits = plugin.scam_signal_hits(
+    hits = plugin._modules()["scamshield"].scam_signal_hits(
         "Your order", "The attached PDF is password protected. Password: 1234",
         "me@example.test")
     assert hits == ["password-protected attachment"]
 
 
 def test_signals_are_case_insensitive(plugin):
-    hits = plugin.scam_signal_hits("ORDER", "PASSWORD PROTECTED document (PDF)", "")
+    hits = plugin._modules()["scamshield"].scam_signal_hits("ORDER", "PASSWORD PROTECTED document (PDF)", "")
     assert hits == ["password-protected attachment"]
 
 
 def test_password_protected_without_pdf_is_near_miss(plugin):
-    assert plugin.scam_signal_hits(
+    assert plugin._modules()["scamshield"].scam_signal_hits(
         "Report", "The archive is password protected.", "me@example.test") == []
 
 
 def test_pdf_without_password_is_near_miss(plugin):
-    assert plugin.scam_signal_hits(
+    assert plugin._modules()["scamshield"].scam_signal_hits(
         "Statement", "Your monthly statement PDF is attached.", "me@example.test") == []
 
 
@@ -62,28 +62,28 @@ def test_signals_are_literal_substrings(plugin):
     # Watcher parity: the pattern is "password protected" with a space. A
     # hyphenated variant does not match — pinned so any future widening is a
     # deliberate, reviewed change rather than silent drift.
-    assert plugin.scam_signal_hits(
+    assert plugin._modules()["scamshield"].scam_signal_hits(
         "Report", "The password-protected PDF is attached.", "") == []
 
 
 def test_undisclosed_recipients_hits(plugin):
-    hits = plugin.scam_signal_hits("Hello", "Dear customer", "undisclosed-recipients:;")
+    hits = plugin._modules()["scamshield"].scam_signal_hits("Hello", "Dear customer", "undisclosed-recipients:;")
     assert hits == ["undisclosed recipients"]
 
 
 def test_both_signals_reported_in_order(plugin):
-    hits = plugin.scam_signal_hits("Invoice", "password protected PDF",
+    hits = plugin._modules()["scamshield"].scam_signal_hits("Invoice", "password protected PDF",
                                    "undisclosed-recipients:;")
     assert hits == ["password-protected attachment", "undisclosed recipients"]
 
 
 def test_clean_mail_has_no_hits(plugin):
-    assert plugin.scam_signal_hits("Lunch", "See you at noon", "me@example.test") == []
+    assert plugin._modules()["scamshield"].scam_signal_hits("Lunch", "See you at noon", "me@example.test") == []
 
 
 def test_signal_split_across_fields_hits(plugin):
     # subject + body + recipient are scanned as one text (watcher parity).
-    hits = plugin.scam_signal_hits("password protected", "see attached pdf", "")
+    hits = plugin._modules()["scamshield"].scam_signal_hits("password protected", "see attached pdf", "")
     assert hits == ["password-protected attachment"]
 
 

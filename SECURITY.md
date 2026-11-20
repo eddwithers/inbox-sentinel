@@ -108,6 +108,12 @@ body limits, not a general phishing detector. False positives (e.g. legitimate
 password-protected bank statements) are expected; the warning re-labels mail,
 it never suppresses it.
 
+The check runs as a first-party module (`modules/scamshield.py`) behind a
+host-enforced boundary: modules receive namespaced state only — no transport,
+credentials, model calls or delivery. A failing or disabled module degrades to
+host-default behaviour and never crashes the poll loop. Third-party module
+loading is deliberately not supported.
+
 ## Release checks
 
 Require fictional adversarial regression tests, canonical Hermes test runner,
