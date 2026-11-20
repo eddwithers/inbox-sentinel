@@ -522,33 +522,92 @@ def _fetch_body(mid):
     return _fetch_content(mid)["body"]
 
 
-# IS-ScamShield — deterministic scam signals, ported from the production push
-# watcher after a fake order-confirmation lure (password-protected PDF) passed
-# as a clean alert. Zero model cost; checked before the importance gate. A hit
-# re-labels the alert, never suppresses the mail: over-warn rather than
-# under-warn, and keep the real summary so the user can judge. Auth results are
-# NOT scam evidence — the original lure passed SPF/DKIM/DMARC because it came
-# from the real company's own compromised mailbox, so nothing here consults
-# them. Signals stay pure (no ctx, no alert shaping) so routing can evolve
-# independently of detection.
-SCAM_SIGNALS = [
-    ("password-protected attachment", "password protected", "pdf"),
-    ("undisclosed recipients", "undisclosed-recipients", None),
-]
+# IS-ScamShield lives in modules/scamshield.py — the first first-party module
+# of the modular platform. Detection is pure and module-owned; alert shaping,
+# budgets, delivery and the read-only contract stay host-owned. Modules are
+# discovered lazily below; a failing or malformed module degrades to
+# host-default behaviour and never crashes the poll loop.
+_MODULES = None
 
 
-def scam_signal_hits(subject, body, recipient):
-    """Return human-readable scam-signal names for this mail (pure check)."""
-    text = f"{subject}\n{body}\n{recipient}".lower()
-    hits = []
-    for name, first, second in SCAM_SIGNALS:
-        if first in text and (second is None or second in text):
-            hits.append(name)
-    return hits
+def _modules():
+    """Discover first-party modules under modules/ (one file per module).
+
+    Loaded by path like the sibling imap module so both the Hermes package
+    load and the single-file test load work. A module must declare NAME and
+    STAGES and provide a callable handler for each declared stage; anything
+    else is skipped with a log line.
+    """
+    global _MODULES
+    if _MODULES is not None:
+        return _MODULES
+    _MODULES = {}
+    import importlib.util as _ilu
+    from pathlib import Path as _Path
+    mdir = _Path(__file__).resolve().parent / "modules"
+    if not mdir.is_dir():
+        return _MODULES
+    for path in sorted(mdir.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        try:
+            spec = _ilu.spec_from_file_location(__name__ + "._module_" + path.stem, path)
+            if spec is None or spec.loader is None:
+                continue
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            name = getattr(mod, "NAME", None)
+            stages = getattr(mod, "STAGES", ())
+            if (not isinstance(name, str) or not name
+                    or not isinstance(stages, (tuple, list)) or not stages
+                    or any(not callable(getattr(mod, s, None)) for s in stages)):
+                logger.warning("module %s skipped: invalid declarations", path.name)
+                continue
+            _MODULES[name] = mod
+        except Exception as exc:
+            logger.warning("module %s failed to load (%s) — skipped", path.name,
+                           type(exc).__name__)
+    return _MODULES
+
+
+class _ModuleAPI:
+    """Bounded module surface: namespaced state only (M0). No transport, no
+    credentials, no model calls, no delivery — those stay host-owned and grow
+    only when a module genuinely needs them."""
+
+    def __init__(self, ctx, name):
+        self._state = ctx.state
+        self._prefix = f"module_{name}_"
+
+    def state_get(self, key, default=None):
+        return self._state.get(self._prefix + str(key), default)
+
+    def state_set(self, key, value):
+        self._state.set(self._prefix + str(key), value)
+
+
+def _run_stage(ctx, stage, message):
+    """Run enabled module handlers for a stage and collect dict outcomes.
+    Module failure degrades to host-default behaviour, never raises."""
+    outcomes = []
+    for name, mod in _modules().items():
+        if stage not in mod.STAGES:
+            continue
+        if not _cfg(ctx, f"module_{name}_enabled", getattr(mod, "DEFAULT_ENABLED", True)):
+            continue
+        try:
+            out = getattr(mod, stage)(message, _ModuleAPI(ctx, name))
+        except Exception as exc:
+            logger.warning("module %s failed at %s (%s) — host default applies",
+                           name, stage, type(exc).__name__)
+            continue
+        if isinstance(out, dict):
+            outcomes.append(out)
+    return outcomes
 
 
 def _scam_alert_text(*, subject, sender, hits, summary="", body="",
-                     mid_prefix=None, mid=None):
+                     mid_prefix=None, mid=None, brand="IS-ScamShield"):
     """Shape the scam warning. Pure string building; routing stays with the
     caller. Untrusted fields go through _safe_text like every other alert."""
     lines = [
@@ -564,7 +623,7 @@ def _scam_alert_text(*, subject, sender, hits, summary="", body="",
     elif body.strip():
         lines += ["Opening excerpt (untrusted):", _safe_text(body, 300), ""]
     lines += [
-        "IS-ScamShield signals detected: " + "; ".join(hits) + ".",
+        f"{brand} signals detected: " + "; ".join(hits) + ".",
         "Auth checks can pass on these: a real company's mailbox may be compromised.",
         "No reply drafted. The mail is left in your inbox untouched for inspection or deletion.",
     ]
@@ -676,8 +735,14 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
     if draft_blocker:
         gate_input += f"\n\n[Reader limitation: {draft_blocker} {context_note}]"
-    scam_hits = scam_signal_hits(subject, body, recipient)
-    if scam_hits:
+    message_view = {"sender": sender, "subject": subject, "body": body,
+                    "recipient": recipient, "attachments": attachments,
+                    "label_ids": label_ids}
+    scam_outcome = next((o for o in _run_stage(ctx, "pre_gate", message_view)
+                         if o.get("force_alert")), None)
+    if scam_outcome:
+        scam_hits = scam_outcome.get("signals", [])
+        brand = str(scam_outcome.get("brand", "IS-ScamShield"))[:60]
         # Deterministic signals outrank the gate: warn even if the model would
         # call this noise, and never draft a reply to a suspected scammer. The
         # gate is consulted only for a summary; if it is unavailable (budget,
@@ -695,7 +760,7 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
                            type(exc).__name__)
         await _deliver(ctx, _scam_alert_text(
             subject=subject, sender=sender, hits=scam_hits, summary=summary,
-            body=body, mid_prefix=mid_prefix, mid=mid))
+            body=body, mid_prefix=mid_prefix, mid=mid, brand=brand))
         _bump_alerts_sent(ctx)
         logger.info("scam alert delivery completed")
         return
@@ -1154,7 +1219,10 @@ async def _test(ctx, args):
     subject = str(args.get("subject", "Test message"))[:300]
     body = str(args.get("body", ""))[:MAX_MESSAGE_BYTES]
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
-    scam_hits = scam_signal_hits(subject, body, "")
+    scam_outcome = next((o for o in _run_stage(ctx, "pre_gate", {
+        "sender": sender, "subject": subject, "body": body, "recipient": "",
+        "attachments": None, "label_ids": []}) if o.get("force_alert")), None)
+    scam_hits = scam_outcome.get("signals", []) if scam_outcome else []
 
     parsed = None
     try:

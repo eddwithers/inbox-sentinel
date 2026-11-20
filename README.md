@@ -177,6 +177,7 @@ labels, archives or deletes your mail.
 | `draft_replies` | `true` | Pre-draft replies for important mail |
 | `daily_gate_cap` | `100` | Classification attempts/day (0–1000); pending mail defers at the limit |
 | `daily_draft_cap` | `15` | Draft attempts/day, including failures |
+| `module_scamshield_enabled` | `true` | IS-ScamShield module — deterministic pre-gate scam warnings |
 | `quiet_labels` | promotions, social | Gmail labels skipped before any model call (ignored for IMAP) |
 | `keyword_overrides` | appointment, invoice, ... | Subject words that override the quiet labels |
 | `skip_recipient_keywords` | *(empty)* | Recipient substrings to ignore (old aliases) |
@@ -243,6 +244,12 @@ Limits: the patterns are literal substrings (a hyphenated "password-protected"
 without the spaced form elsewhere does not match), only the first 4,000
 characters of body are scanned, and this is a heuristic for two known lure
 shapes — not a general phishing detector or a guarantee of safety.
+
+IS-ScamShield is the first module of Sentinel's modular platform: it ships in
+`modules/scamshield.py` and toggles with `module_scamshield_enabled`. Modules
+receive namespaced state only — transport, model budgets, alert shaping,
+delivery and the read-only contract stay host-owned, and a failing or disabled
+module degrades to host-default behaviour.
 
 ### Runtime verification
 
