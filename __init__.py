@@ -571,13 +571,16 @@ def _modules():
 
 
 class _ModuleAPI:
-    """Bounded module surface: namespaced state only (M0). No transport, no
+    """Bounded module surface. Namespaced state, declared shared-state reads,
+    trusted local config reads, and pure host helpers. No transport, no
     credentials, no model calls, no delivery — those stay host-owned and grow
     only when a module genuinely needs them."""
 
-    def __init__(self, ctx, name):
+    def __init__(self, ctx, name, module=None):
+        self._ctx = ctx
         self._state = ctx.state
         self._prefix = f"module_{name}_"
+        self._shared = tuple(getattr(module, "SHARED_STATE", ()))
 
     def state_get(self, key, default=None):
         return self._state.get(self._prefix + str(key), default)
@@ -585,24 +588,44 @@ class _ModuleAPI:
     def state_set(self, key, value):
         self._state.set(self._prefix + str(key), value)
 
+    def shared_get(self, key, default=None):
+        """Read a host state key only if the module declared it in SHARED_STATE."""
+        if key not in self._shared:
+            raise PermissionError(f"undeclared shared state key: {key}")
+        return self._state.get(key, default)
+
+    def config_get(self, key, default=None):
+        return _cfg(self._ctx, key, default)
+
+    def sender_matches(self, sender, rule):
+        return _sender_matches(sender, rule)
+
 
 def _run_stage(ctx, stage, message):
-    """Run enabled module handlers for a stage and collect dict outcomes.
-    Module failure degrades to host-default behaviour, never raises."""
+    """Run enabled module handlers for a stage in priority order and collect
+    dict outcomes. Module failure degrades to host-default behaviour, never
+    raises."""
     outcomes = []
-    for name, mod in _modules().items():
+    ordered = sorted(_modules().items(),
+                     key=lambda kv: (getattr(kv[1], "PRIORITY", 100), kv[0]))
+    for name, mod in ordered:
         if stage not in mod.STAGES:
             continue
         if not _cfg(ctx, f"module_{name}_enabled", getattr(mod, "DEFAULT_ENABLED", True)):
             continue
         try:
-            out = getattr(mod, stage)(message, _ModuleAPI(ctx, name))
+            out = getattr(mod, stage)(message, _ModuleAPI(ctx, name, mod))
         except Exception as exc:
             logger.warning("module %s failed at %s (%s) — host default applies",
                            name, stage, type(exc).__name__)
             continue
         if isinstance(out, dict):
             outcomes.append(out)
+            # Flags propagate within the stage in priority order: a later
+            # module sees an earlier module's flags (e.g. the vip rescue).
+            flags = out.get("flags")
+            if isinstance(flags, dict) and isinstance(message.get("flags"), dict):
+                message["flags"].update(flags)
     return outcomes
 
 
@@ -695,26 +718,11 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     sender = str(sender)[:300]
     subject = str(subject)[:300]
     reply_to = str(reply_to)[:300]
-    state = ctx.state
-    learned_blocked = state.get("learned_blocked_senders", {})
-    if any(_sender_matches(sender, s) for s in learned_blocked):
-        logger.info("noise (learned rule)")
-        return
-
-    skip_words = [w.lower() for w in _cfg(ctx, "skip_recipient_keywords", [])]
-    if any(w in recipient.lower() for w in skip_words):
-        logger.info("skipped recipient alias")
-        return
-
-    quiet_labels = set(_cfg(ctx, "quiet_labels",
-                            ["CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"]))
-    keywords = [k.lower() for k in _cfg(ctx, "keyword_overrides", [])]
-    learned_vip = state.get("learned_vip_senders", {})
-    is_vip = any(_sender_matches(sender, s) for s in learned_vip)
-    if not is_vip and quiet_labels & set(label_ids or []):
-        low = (subject or "").lower()
-        if not any(k in low for k in keywords):
-            logger.info("noise (local filter)")
+    message_view = {"sender": sender, "subject": subject, "recipient": recipient,
+                    "label_ids": label_ids, "flags": {}}
+    for outcome in _run_stage(ctx, "prefilter", message_view):
+        if outcome.get("drop"):
+            logger.info(str(outcome.get("reason", "noise (module)"))[:120])
             return
 
     try:
@@ -735,9 +743,7 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
     if draft_blocker:
         gate_input += f"\n\n[Reader limitation: {draft_blocker} {context_note}]"
-    message_view = {"sender": sender, "subject": subject, "body": body,
-                    "recipient": recipient, "attachments": attachments,
-                    "label_ids": label_ids}
+    message_view.update({"body": body, "attachments": attachments})
     scam_outcome = next((o for o in _run_stage(ctx, "pre_gate", message_view)
                          if o.get("force_alert")), None)
     if scam_outcome:
@@ -771,7 +777,9 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
         return
     verdict = parsed["verdict"]
     summary = parsed.get("summary", "")
-    if is_vip and verdict == "NOISE":
+    message_view["verdict"] = verdict
+    if verdict == "NOISE" and any(o.get("force_important")
+                                  for o in _run_stage(ctx, "gate", message_view)):
         logger.info("gate overruled by exact sender preference (not authenticated identity)")
         verdict = "IMPORTANT"
     if verdict == "NOISE":
