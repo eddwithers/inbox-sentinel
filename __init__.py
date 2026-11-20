@@ -522,14 +522,14 @@ def _fetch_body(mid):
     return _fetch_content(mid)["body"]
 
 
-# Deterministic scam signals, ported from the production push watcher after a
-# fake order-confirmation lure (password-protected PDF) passed as a clean
-# alert. Zero model cost; checked before the importance gate. A hit re-labels
-# the alert, never suppresses the mail: over-warn rather than under-warn, and
-# keep the real summary so the user can judge. Auth results are NOT scam
-# evidence — the original lure passed SPF/DKIM/DMARC because it came from the
-# real company's own compromised mailbox, so nothing here consults them.
-# Signals stay pure (no ctx, no alert shaping) so routing can evolve
+# IS-ScamShield — deterministic scam signals, ported from the production push
+# watcher after a fake order-confirmation lure (password-protected PDF) passed
+# as a clean alert. Zero model cost; checked before the importance gate. A hit
+# re-labels the alert, never suppresses the mail: over-warn rather than
+# under-warn, and keep the real summary so the user can judge. Auth results are
+# NOT scam evidence — the original lure passed SPF/DKIM/DMARC because it came
+# from the real company's own compromised mailbox, so nothing here consults
+# them. Signals stay pure (no ctx, no alert shaping) so routing can evolve
 # independently of detection.
 SCAM_SIGNALS = [
     ("password-protected attachment", "password protected", "pdf"),
@@ -564,7 +564,7 @@ def _scam_alert_text(*, subject, sender, hits, summary="", body="",
     elif body.strip():
         lines += ["Opening excerpt (untrusted):", _safe_text(body, 300), ""]
     lines += [
-        "Scam signals detected: " + "; ".join(hits) + ".",
+        "IS-ScamShield signals detected: " + "; ".join(hits) + ".",
         "Auth checks can pass on these: a real company's mailbox may be compromised.",
         "No reply drafted. The mail is left in your inbox untouched for inspection or deletion.",
     ]

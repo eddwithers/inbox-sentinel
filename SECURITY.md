@@ -92,7 +92,7 @@ under their policies. Plugin logs omit message subjects, sender addresses and ra
 provider error bodies in the hardened paths. Hermes/provider logging has its own
 policy. There is no plugin telemetry.
 
-## Scam signals
+## IS-ScamShield (scam signals)
 
 A deterministic substring check (password-protected PDF attachment;
 `undisclosed-recipients:;`) runs on subject, body and recipient headers before

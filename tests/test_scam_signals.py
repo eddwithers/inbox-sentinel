@@ -99,6 +99,7 @@ def test_scam_alerts_even_when_gate_says_noise(plugin, ctx, gmail):
     assert len(ctx.delivered_messages) == 1
     text = ctx.delivered_messages[0]
     assert text.startswith("POSSIBLE SCAM")
+    assert "IS-ScamShield" in text
     assert "password-protected attachment" in text
     assert "do not reply" in text
     assert "Suggested reply" not in text
