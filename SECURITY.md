@@ -114,6 +114,15 @@ credentials, model calls or delivery. A failing or disabled module degrades to
 host-default behaviour and never crashes the poll loop. Third-party module
 loading is deliberately not supported.
 
+IS-AttachmentGuard and IS-LinkGuard extend the same warning path with
+deterministic attachment-metadata and URL heuristics: attachment contents are
+never read, URL analysis is offline and bounded (50 URLs, no reputation
+feeds), and both over-warn by design. IS-StormShield suppresses
+identical-repeat alert storms (same sender, subject and body hash within a
+configurable window); first arrivals always alert, transport retries never
+count, different bodies never suppress each other, and security warnings
+outrank suppression. Storm state is namespaced and bounded.
+
 ## Release checks
 
 Require fictional adversarial regression tests, canonical Hermes test runner,
