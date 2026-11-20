@@ -44,6 +44,9 @@ entirely.
   shapes (password-protected PDF attachments, undisclosed recipients) before the
   gate. A hit arrives as a POSSIBLE SCAM alert with the real summary, never a
   draft reply — see [IS-ScamShield](#is-scamshield).
+- **Guard modules.** IS-AttachmentGuard and IS-LinkGuard flag dangerous
+  attachments and suspicious links the same way; IS-StormShield keeps
+  identical-repeat storms from flooding your alert channel.
 - **An importance gate with taste.** What survives the local filter is classified by the
   model you already run — tuned by a plain-language description of *your* priorities.
 - **Replies drafted for review.** Important messages can arrive with a first-person
@@ -180,6 +183,11 @@ labels, archives or deletes your mail.
 | `module_scamshield_enabled` | `true` | IS-ScamShield module — deterministic pre-gate scam warnings |
 | `module_noisefilter_enabled` | `true` | IS-NoiseFilter module — local zero-cost noise drops |
 | `module_senderlearning_enabled` | `true` | IS-SenderLearning module — learned exact-sender rules |
+| `module_attachmentguard_enabled` | `true` | IS-AttachmentGuard module — attachment-risk warnings |
+| `module_linkguard_enabled` | `true` | IS-LinkGuard module — suspicious-URL warnings |
+| `module_stormshield_enabled` | `true` | IS-StormShield module — identical-repeat storm suppression |
+| `storm_window_minutes` | `30` | IS-StormShield window for counting identical repeats |
+| `storm_threshold` | `3` | Identical arrivals within the window before repeats suppress |
 | `quiet_labels` | promotions, social | Gmail labels skipped before any model call (ignored for IMAP) |
 | `keyword_overrides` | appointment, invoice, ... | Subject words that override the quiet labels |
 | `skip_recipient_keywords` | *(empty)* | Recipient substrings to ignore (old aliases) |
@@ -252,6 +260,47 @@ IS-ScamShield is the first module of Sentinel's modular platform: it ships in
 receive namespaced state only — transport, model budgets, alert shaping,
 delivery and the read-only contract stay host-owned, and a failing or disabled
 module degrades to host-default behaviour.
+
+### IS-AttachmentGuard
+
+Deterministic attachment-risk warnings from attachment **metadata only** —
+file contents are never read. Flags: executables and scripts (`.exe`, `.scr`,
+`.js`, `.iso`, `.lnk`, …), double extensions (`invoice.pdf.exe`), macro-enabled
+Office documents (`.docm`, `.xlsm`, …), HTML attachments (credential-harvesting
+pages), and archives the body claims are password-protected. Hits join the
+POSSIBLE SCAM warning with their own signals line; no reply is drafted.
+False positives are expected (a legitimate script asset or family archive will
+warn) — over-warn rather than under-warn. Toggle:
+`module_attachmentguard_enabled`.
+
+### IS-LinkGuard
+
+Deterministic suspicious-URL warnings, offline and bounded (at most 50 URLs,
+2,048 characters each; no reputation feeds, no network). Checks links from the
+HTML body and URLs visible in the text for: IP-literal destinations (including
+hex obfuscation), embedded credentials (`http://***@evil.com`),
+punycode/IDN homograph hosts, URL shorteners, high-risk TLDs (`.zip`, `.mov`
+and heavily abused free TLDs), deep subdomain chains, and plaintext-HTTP URLs
+carrying login/verify/billing language. Hits join the POSSIBLE SCAM warning;
+no reply is drafted. Legitimate shorteners and IDN hosts will warn — that is
+the intended trade. Toggle: `module_linkguard_enabled`.
+
+### IS-StormShield
+
+Protects the alert channel itself: when the same sender blasts the same
+message — same subject **and** same body hash — repeatedly within a window,
+the first arrivals still alert and only repeats beyond the threshold are
+suppressed (default: the 3rd identical arrival within 30 minutes; tune
+`storm_threshold` and `storm_window_minutes`). Safety invariants:
+
+- The first occurrence always alerts; different bodies never suppress each
+  other, so two genuine incidents with the same subject both come through.
+- Transport retries of the same message never count as new arrivals.
+- Security warnings outrank suppression — a scam-shaped storm still warns.
+- State is namespaced and bounded (200 keys, oldest evicted); a garbage config
+  degrades to defaults rather than misfiring.
+
+Toggle: `module_stormshield_enabled`.
 
 ### Runtime verification
 

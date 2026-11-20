@@ -477,6 +477,28 @@ def _strip_html(html):
     return parser.text()
 
 
+class _LinkParser(HTMLParser):
+    """Linear-time href collector for IS-LinkGuard: one pass, bounded count
+    and length, same truncation-before-scan discipline as _strip_html."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a" and len(self.links) < 50:
+            for key, value in attrs:
+                if key == "href" and value:
+                    self.links.append(str(value)[:2048])
+
+
+def _extract_links(html):
+    parser = _LinkParser()
+    parser.feed(str(html)[:HTML_STRIP_LIMIT])
+    parser.close()
+    return parser.links
+
+
 def _extract_message_content(parsed):
     """Separate visible body text from attachments; never interpret file content."""
     attachments = []
@@ -504,9 +526,10 @@ def _extract_message_content(parsed):
             attachments.append({"filename": "", "content_type": content_type})
 
     visit(parsed)
+    html = "\n".join(bodies["text/html"])
     plain = "\n".join(bodies["text/plain"])
-    body = plain if plain.strip() else _strip_html("\n".join(bodies["text/html"]))
-    return {"body": body, "attachments": attachments}
+    body = plain if plain.strip() else _strip_html(html)
+    return {"body": body, "attachments": attachments, "links": _extract_links(html)}
 
 
 def _fetch_content(mid):
@@ -629,10 +652,12 @@ def _run_stage(ctx, stage, message):
     return outcomes
 
 
-def _scam_alert_text(*, subject, sender, hits, summary="", body="",
-                     mid_prefix=None, mid=None, brand="IS-ScamShield"):
+def _scam_alert_text(*, subject, sender, groups, summary="", body="",
+                     mid_prefix=None, mid=None):
     """Shape the scam warning. Pure string building; routing stays with the
-    caller. Untrusted fields go through _safe_text like every other alert."""
+    caller. Untrusted fields go through _safe_text like every other alert.
+    ``groups`` is a list of (brand, signal-names) pairs, one per module that
+    forced the alert."""
     lines = [
         "POSSIBLE SCAM — do not open attachments, do not enter any PDF password, do not reply.",
         "",
@@ -645,8 +670,9 @@ def _scam_alert_text(*, subject, sender, hits, summary="", body="",
         lines += [_safe_text(summary), ""]
     elif body.strip():
         lines += ["Opening excerpt (untrusted):", _safe_text(body, 300), ""]
+    for brand, hits in groups:
+        lines.append(f"{brand} signals detected: " + "; ".join(hits) + ".")
     lines += [
-        f"{brand} signals detected: " + "; ".join(hits) + ".",
         "Auth checks can pass on these: a real company's mailbox may be compromised.",
         "No reply drafted. The mail is left in your inbox untouched for inspection or deletion.",
     ]
@@ -719,7 +745,7 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     subject = str(subject)[:300]
     reply_to = str(reply_to)[:300]
     message_view = {"sender": sender, "subject": subject, "recipient": recipient,
-                    "label_ids": label_ids, "flags": {}}
+                    "label_ids": label_ids, "flags": {}, "mid": mid}
     for outcome in _run_stage(ctx, "prefilter", message_view):
         if outcome.get("drop"):
             logger.info(str(outcome.get("reason", "noise (module)"))[:120])
@@ -743,18 +769,20 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
     if draft_blocker:
         gate_input += f"\n\n[Reader limitation: {draft_blocker} {context_note}]"
-    message_view.update({"body": body, "attachments": attachments})
-    scam_outcome = next((o for o in _run_stage(ctx, "pre_gate", message_view)
-                         if o.get("force_alert")), None)
-    if scam_outcome:
-        scam_hits = scam_outcome.get("signals", [])
-        brand = str(scam_outcome.get("brand", "IS-ScamShield"))[:60]
+    message_view.update({"body": body, "attachments": attachments,
+                         "links": content.get("links", []) if isinstance(content, dict) else []})
+    pre_gate_outcomes = _run_stage(ctx, "pre_gate", message_view)
+    force_groups = [(str(o.get("brand", "IS-ScamShield"))[:60], o.get("signals", []))
+                    for o in pre_gate_outcomes if o.get("force_alert")]
+    if force_groups:
         # Deterministic signals outrank the gate: warn even if the model would
         # call this noise, and never draft a reply to a suspected scammer. The
         # gate is consulted only for a summary; if it is unavailable (budget,
-        # outage, bad output) the warning still goes out. No archive or other
-        # mailbox action — the plugin is read-only and the mail stays for inspection.
-        logger.info("scam signals detected: %s", "; ".join(scam_hits))
+        # outage, bad output) the warning still goes out. Security warnings
+        # also outrank module drops (e.g. storm suppression). No archive or
+        # other mailbox action — read-only, the mail stays for inspection.
+        logger.info("scam signals detected: %s",
+                    "; ".join(s for _, hits in force_groups for s in hits))
         summary = ""
         try:
             gate = await _gate_call(ctx, gate_input)
@@ -765,10 +793,14 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
             logger.warning("scam summary unavailable (%s) — sending deterministic warning",
                            type(exc).__name__)
         await _deliver(ctx, _scam_alert_text(
-            subject=subject, sender=sender, hits=scam_hits, summary=summary,
-            body=body, mid_prefix=mid_prefix, mid=mid, brand=brand))
+            subject=subject, sender=sender, groups=force_groups, summary=summary,
+            body=body, mid_prefix=mid_prefix, mid=mid))
         _bump_alerts_sent(ctx)
         logger.info("scam alert delivery completed")
+        return
+    dropped = next((o for o in pre_gate_outcomes if o.get("drop")), None)
+    if dropped:
+        logger.info(str(dropped.get("reason", "dropped (module)"))[:120])
         return
     gate = await _gate_call(ctx, gate_input)
     parsed = _validated_gate(gate)
@@ -1227,10 +1259,17 @@ async def _test(ctx, args):
     subject = str(args.get("subject", "Test message"))[:300]
     body = str(args.get("body", ""))[:MAX_MESSAGE_BYTES]
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
-    scam_outcome = next((o for o in _run_stage(ctx, "pre_gate", {
+    pre_gate_outcomes = _run_stage(ctx, "pre_gate", {
         "sender": sender, "subject": subject, "body": body, "recipient": "",
-        "attachments": None, "label_ids": []}) if o.get("force_alert")), None)
-    scam_hits = scam_outcome.get("signals", []) if scam_outcome else []
+        "attachments": None, "label_ids": [], "links": [], "flags": {}})
+    force_groups = [(str(o.get("brand", "IS-ScamShield"))[:60], o.get("signals", []))
+                    for o in pre_gate_outcomes if o.get("force_alert")]
+    scam_hits = [s for _, hits in force_groups for s in hits]
+    if not force_groups:
+        dropped = next((o for o in pre_gate_outcomes if o.get("drop")), None)
+        if dropped:
+            return {"verdict": "NOISE", "suppressed": True,
+                    "summary": str(dropped.get("reason", "suppressed by module"))[:200]}
 
     parsed = None
     try:
@@ -1247,7 +1286,7 @@ async def _test(ctx, args):
                "draft_withheld_reason": "Possible scam — never draft a reply to a suspected scammer."}
         if args.get("deliver"):
             await _deliver(ctx, _scam_alert_text(
-                subject=subject, sender=sender, hits=scam_hits, summary=summary, body=body))
+                subject=subject, sender=sender, groups=force_groups, summary=summary, body=body))
             out["delivered"] = True
         return out
     if parsed is None:

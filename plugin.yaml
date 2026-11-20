@@ -152,6 +152,36 @@ config_schema:
     description: >-
       IS-SenderLearning module — learned exact-sender rules (always-noise
       drops, always-important rescue and gate override)
+  module_attachmentguard_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-AttachmentGuard module — deterministic attachment-risk warnings
+      (executables, double extensions, macro documents, HTML attachments,
+      password-protected archives)
+  module_linkguard_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-LinkGuard module — deterministic suspicious-URL warnings (IP-literal
+      links, embedded credentials, punycode, shorteners, high-risk TLDs,
+      insecure login URLs)
+  module_stormshield_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-StormShield module — suppress identical-repeat alert storms; first
+      arrivals always alert and security warnings are never suppressed
+  storm_window_minutes:
+    type: int
+    default: 30
+    description: IS-StormShield window (minutes) for counting identical repeats
+  storm_threshold:
+    type: int
+    default: 3
+    description: >-
+      IS-StormShield: identical arrivals within the window before repeats
+      suppress (the first threshold-1 still alert)
   quiet_labels:
     type: list
     default: [CATEGORY_PROMOTIONS, CATEGORY_SOCIAL]
