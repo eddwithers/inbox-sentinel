@@ -27,9 +27,47 @@ optional_env:
   - name: INBOX_SENTINEL_CLIENT_SECRET
     description: Google Cloud OAuth client secret for Gmail access
     secret: true
+  - name: INBOX_SENTINEL_IMAP_PASSWORD2
+    description: IMAP password for the second account slot (multi-account registry)
+    secret: true
+  - name: INBOX_SENTINEL_IMAP_PASSWORD3
+    description: IMAP password for the third account slot (multi-account registry)
+    secret: true
+  - name: INBOX_SENTINEL_IMAP_PASSWORD4
+    description: IMAP password for the fourth account slot (multi-account registry)
+    secret: true
 
 oauth:
   - id: gmail
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/gmail.readonly
+    client_id_env: INBOX_SENTINEL_CLIENT_ID
+    client_secret_env: INBOX_SENTINEL_CLIENT_SECRET
+    hosts: [gmail.googleapis.com]
+    authorize_params: {access_type: offline, prompt: consent}
+  # Multi-account pool (M2): same read-only client, one grant per account.
+  # Sign in each separately: hermes auth add inbox-sentinel:gmail2 etc.
+  - id: gmail2
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/gmail.readonly
+    client_id_env: INBOX_SENTINEL_CLIENT_ID
+    client_secret_env: INBOX_SENTINEL_CLIENT_SECRET
+    hosts: [gmail.googleapis.com]
+    authorize_params: {access_type: offline, prompt: consent}
+  - id: gmail3
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/gmail.readonly
+    client_id_env: INBOX_SENTINEL_CLIENT_ID
+    client_secret_env: INBOX_SENTINEL_CLIENT_SECRET
+    hosts: [gmail.googleapis.com]
+    authorize_params: {access_type: offline, prompt: consent}
+  - id: gmail4
     authorize_url: https://accounts.google.com/o/oauth2/v2/auth
     token_url: https://oauth2.googleapis.com/token
     scopes:
@@ -42,6 +80,31 @@ oauth:
 python_dependencies: []
 
 config_schema:
+  accounts:
+    type: str
+    default: ""
+    description: >-
+      Multi-account registry (M2): a JSON list of up to 4 accounts, each
+      {"id", "label", "provider": gmail|imap, "enabled", "oauth_id" (gmail:
+      gmail|gmail2|gmail3|gmail4), "password_env" (imap: the declared
+      INBOX_SENTINEL_IMAP_PASSWORD pool), "gmail_query", "imap_host/port/
+      ssl/user/folder", "importance_profile", "delivery_target"}. Empty =
+      legacy single-account mode (the flat settings below). Credentials
+      never go in this JSON — sign in per account with hermes auth add
+      inbox-sentinel:<oauth_id>; IMAP passwords live in the masked secret
+      fields. Invalid configuration stops polling; [] watches no accounts.
+      Every Gmail entry needs a distinct grant id. Use a new account id
+      when changing its connection.
+  mode:
+    type: str
+    default: custom
+    choices: [watcher, desk_pa, custom]
+    description: >-
+      Capability preset over the module toggles. watcher = read-only alerts (scamshield, noisefilter,
+      senderlearning, drafter, alertshaper, inboxswitch on; platform guards
+      off). desk_pa = all shipped modules on (read-only preview, NOT parity
+      with an existing Desk PA; write capabilities are deferred). custom = individual
+      toggles. In preset modes the preset wins over individual toggles.
   client_id:
     type: secret
     env: INBOX_SENTINEL_CLIENT_ID
@@ -96,6 +159,21 @@ config_schema:
     description: >-
       IMAP password or app password. For Gmail-over-IMAP, use a Google app
       password. Store it in the profile secret field, never in chat.
+  imap_password2:
+    type: secret
+    env: INBOX_SENTINEL_IMAP_PASSWORD2
+    label: IMAP password (slot 2)
+    description: Secret for multi-account slot 2; never put it in accounts JSON
+  imap_password3:
+    type: secret
+    env: INBOX_SENTINEL_IMAP_PASSWORD3
+    label: IMAP password (slot 3)
+    description: Secret for multi-account slot 3; never put it in accounts JSON
+  imap_password4:
+    type: secret
+    env: INBOX_SENTINEL_IMAP_PASSWORD4
+    label: IMAP password (slot 4)
+    description: Secret for multi-account slot 4; never put it in accounts JSON
   imap_folder:
     type: str
     default: INBOX
@@ -187,6 +265,14 @@ config_schema:
       IS-AlertShaper module — shapes the normal EMAIL ALERT text
       (byte-identical to the host fallback). Off or failing = host shaping
       applies; POSSIBLE SCAM warnings are always host-shaped
+  module_inboxswitch_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-InboxSwitch module — multi-account switching policy: disabled-
+      account drop invariant and the account tag on multi-account alerts.
+      Account connections themselves are host core; off or failing =
+      behaviour-identical host fallbacks
   storm_window_minutes:
     type: int
     default: 30

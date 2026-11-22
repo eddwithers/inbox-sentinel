@@ -147,16 +147,20 @@ def _parse_message_bytes(raw):
     return parser.close()
 
 
-async def _resource_notice(ctx, mid_prefix, mid, reason):
+async def _resource_notice(ctx, mid_prefix, mid, reason, account=None):
     # Static reason selected by trusted code; never echo sender-controlled bytes.
     day = time.strftime("%Y-%m-%d")
-    if ctx.state.get("resource_notice_day") == day:
+    key = f"acct_{account['id']}_resource_notice_day" if account else "resource_notice_day"
+    if ctx.state.get(key) == day:
         return
-    await _deliver(ctx, "EMAIL ALERT — review original email\n\n"
-                   "A message exceeded the safe parsing limits or had invalid size metadata.\n"
-                   "No model call or draft was made. Check your mailbox.\n"
-                   "Further resource-limit warnings are suppressed until tomorrow.")
-    ctx.state.set("resource_notice_day", day)
+    text = ("EMAIL ALERT — review original email\n\n"
+            "A message exceeded the safe parsing limits or had invalid size metadata.\n"
+            "No model call or draft was made. Check your mailbox.\n"
+            "Further resource-limit warnings are suppressed until tomorrow.")
+    if account:
+        text = _insert_account_tag(text, _safe_text(account["label"], 60))
+    await _deliver(ctx, text, account=account)
+    ctx.state.set(key, day)
 
 ACCESS_RETRY_SECONDS = 300    # poll interval while the account cannot be reached
 FAILURE_NOTICE_AFTER = 4      # consecutive failed polls before a health notice
@@ -169,25 +173,35 @@ _HEALTH_REASONS = {
 }
 
 
-async def _health_notice(ctx, kind, **fields):
-    """Tell the user once per day that the watcher is not working. Static text only."""
+async def _health_notice(ctx, kind, account=None, **fields):
+    """Tell the user once per day (per account in multi-account mode) that
+    the watcher is not working. Static text only."""
     day = time.strftime("%Y-%m-%d")
-    if ctx.state.get("health_notice_day") == day:
+    key = f"acct_{account['id']}_health_notice_day" if account else "health_notice_day"
+    if ctx.state.get(key) == day:
         return
     reason = _HEALTH_REASONS[kind].format(**fields)
-    fix = ("Sign in again: run `hermes auth add inbox-sentinel:gmail` in a terminal "
-           "on the Hermes host, for this profile."
-           if kind in ("not_signed_in", "auth_failed") else
-           "Check `inbox_sentinel_status` and your mailbox settings.")
+    if account and account.get("provider") == "gmail" and kind in ("not_signed_in", "auth_failed"):
+        fix = (f"Sign in again: run `hermes auth add inbox-sentinel:{account['oauth_id']}` "
+               "in a terminal on the Hermes host, for this profile.")
+    elif account and account.get("provider") == "imap":
+        fix = "Check this account's IMAP connection and profile secret settings."
+    else:
+        fix = ("Sign in again: run `hermes auth add inbox-sentinel:gmail` in a terminal "
+               "on the Hermes host, for this profile."
+               if kind in ("not_signed_in", "auth_failed") else
+               "Check `inbox_sentinel_status` and your mailbox settings.")
     text = ("INBOX SENTINEL — not watching your inbox\n\n" + reason + "\n"
             "New email will not raise alerts until this is fixed. Check your inbox directly.\n"
             + fix + "\nFurther health warnings are suppressed until tomorrow.")
+    if account:
+        text = _insert_account_tag(text, _safe_text(account["label"], 60))
     try:
-        await _deliver(ctx, text)
+        await _deliver(ctx, text, account=account)
     except Exception as exc:
         logger.warning("health notice delivery failed (%s)", type(exc).__name__)
         return
-    ctx.state.set("health_notice_day", day)
+    ctx.state.set(key, day)
 
 DEFAULT_IMPORTANCE = (
     "Anything the user personally needs to reply to or decide on: family, "
@@ -305,6 +319,157 @@ def _cfg(ctx, key, default):
         return default
 
 
+# ---------------------------------------------------------------- accounts
+
+_GMAIL_OAUTH_POOL = ("gmail", "gmail2", "gmail3", "gmail4")
+_IMAP_SECRET_POOL = ("INBOX_SENTINEL_IMAP_PASSWORD", "INBOX_SENTINEL_IMAP_PASSWORD2",
+                     "INBOX_SENTINEL_IMAP_PASSWORD3", "INBOX_SENTINEL_IMAP_PASSWORD4")
+_ACCOUNTS_MAX = 4
+_SECRET_KEY_BLOCKLIST = {"password", "secret", "token", "client_secret",
+                         "imap_password", "api_key", "apikey",
+                         "refresh_token", "access_token"}
+_SECRET_VALUE_PREFIXES = ("-----BEGIN", "ghp_", "gho_", "github_pat_",
+                          "sk-", "AIza", "xoxb-", "xoxp-")
+
+
+class AccountConfigurationError(ValueError):
+    """Invalid account settings: poll nothing, never fall back to a grant."""
+
+
+def _accounts(ctx):
+    """Absent/blank config preserves legacy mode; explicit [] watches nothing.
+
+    Invalid configuration stops polling. Never choose another mailbox as an
+    error fallback. Credentials are referenced by declared grant/secret names.
+    """
+    raw = _cfg(ctx, "accounts", "")
+    if isinstance(raw, str) and not raw.strip():
+        return []
+    try:
+        if not isinstance(raw, str):
+            raise ValueError("accounts must be JSON text")
+        return _parse_accounts(ctx, raw)
+    except (ValueError, TypeError, RecursionError) as exc:
+        logger.warning("invalid accounts configuration — polling stopped")
+        raise AccountConfigurationError("Invalid accounts configuration; polling stopped") from None
+
+
+def _parse_accounts(ctx, raw):
+    if len(raw) > 20000:
+        raise ValueError("accounts config too large")
+    data = json.loads(raw)
+    if not isinstance(data, list) or len(data) > _ACCOUNTS_MAX:
+        raise ValueError("accounts must be a list of at most four entries")
+    out, ids, grants = [], set(), set()
+    allowed = {"id", "label", "provider", "enabled", "oauth_id", "password_env",
+               "gmail_query", "imap_host", "imap_port", "imap_ssl", "imap_user",
+               "imap_folder", "importance_profile", "delivery_target"}
+    for item in data:
+        if not isinstance(item, dict):
+            raise ValueError("account entry must be an object")
+        if set(item) - allowed:
+            raise ValueError("unknown account field")
+        for key, value in item.items():
+            if str(key).lower() in _SECRET_KEY_BLOCKLIST:
+                raise ValueError("credentials never belong in the accounts config")
+            if isinstance(value, str) and value.startswith(_SECRET_VALUE_PREFIXES):
+                raise ValueError("secret-looking value in accounts config")
+        aid = item.get("id")
+        if (not isinstance(aid, str) or not re.fullmatch(r"[a-z0-9_-]{1,32}", aid)
+                or aid in ids):
+            raise ValueError("account id must be a unique [a-z0-9_-]{1,32} slug")
+        provider = item.get("provider", "gmail")
+        if provider not in ("gmail", "imap"):
+            raise ValueError("provider must be gmail or imap")
+        label = item.get("label", aid)
+        if not isinstance(label, str) or not label.strip() or len(label) > 60:
+            raise ValueError("label must be 1-60 chars")
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a bool")
+        acct = {"id": aid, "label": label, "provider": provider, "enabled": enabled}
+        if provider == "gmail":
+            if any(k.startswith("imap_") or k == "password_env" for k in item):
+                raise ValueError("IMAP settings on Gmail account")
+            oauth_id = item.get("oauth_id", "gmail")
+            if oauth_id not in _GMAIL_OAUTH_POOL or oauth_id in grants:
+                raise ValueError("each Gmail account needs a distinct declared grant")
+            grants.add(oauth_id)
+            acct["oauth_id"] = oauth_id
+            query = item.get("gmail_query", "")
+            if not isinstance(query, str) or len(query) > 1000:
+                raise ValueError("gmail_query must be <=1000 chars")
+            acct["gmail_query"] = query
+        else:
+            if "oauth_id" in item or "gmail_query" in item:
+                raise ValueError("Gmail settings on IMAP account")
+            password_env = item.get("password_env", _IMAP_SECRET_POOL[0])
+            if password_env not in _IMAP_SECRET_POOL:
+                raise ValueError("password_env outside the declared pool")
+            acct["password_env"] = password_env
+            for key, default in (("imap_host", ""), ("imap_user", ""),
+                                 ("imap_folder", "INBOX")):
+                value = item.get(key, _cfg(ctx, key, default))
+                if not isinstance(value, str) or len(value) > 300:
+                    raise ValueError(f"{key} must be a string <=300 chars")
+                acct[key] = value
+            port = item.get("imap_port", _cfg(ctx, "imap_port", 993))
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                raise ValueError("imap_port must be 1-65535")
+            acct["imap_port"] = port
+            use_ssl = item.get("imap_ssl", _cfg(ctx, "imap_ssl", True))
+            if not isinstance(use_ssl, bool):
+                raise ValueError("imap_ssl must be a bool")
+            acct["imap_ssl"] = use_ssl
+        profile = item.get("importance_profile", "")
+        if not isinstance(profile, str) or len(profile) > 2000:
+            raise ValueError("importance_profile must be <=2000 chars")
+        acct["importance_profile"] = profile
+        target = item.get("delivery_target", "")
+        if not isinstance(target, str) or len(target) > 200:
+            raise ValueError("delivery_target must be a string <=200 chars")
+        acct["delivery_target"] = target
+        ids.add(aid)
+        out.append(acct)
+    return out
+
+
+# ---------------------------------------------------------------- modes
+
+_WATCHER_BUNDLE = frozenset({"scamshield", "noisefilter", "senderlearning",
+                             "drafter", "alertshaper", "inboxswitch"})
+_READ_ONLY_SCOPES = frozenset({"gmail.readonly"})
+
+
+def _module_enabled(ctx, name, mod):
+    """Effective module enablement. Mode presets are host-level bundles over
+    the toggles (preset wins in watcher/desk_pa); custom — the default —
+    honours individual toggles exactly as before."""
+    mode = str(_cfg(ctx, "mode", "custom")).strip().lower()
+    if mode == "watcher":
+        return name in _WATCHER_BUNDLE
+    if mode == "desk_pa":
+        return True
+    return bool(_cfg(ctx, f"module_{name}_enabled",
+                     getattr(mod, "DEFAULT_ENABLED", True)))
+
+
+def _module_scopes_ok(mod):
+    """Fail-closed write refusal: no consent flow exists yet, so a module
+    declaring scopes beyond read-only never runs (design §5; write modules
+    are M3+ with explicit per-mode re-consent)."""
+    scopes = getattr(mod, "SCOPES", ("gmail.readonly",))
+    return (isinstance(scopes, (tuple, list))
+            and all(isinstance(s, str) and s in _READ_ONLY_SCOPES for s in scopes))
+
+
+def _insert_account_tag(text, tag):
+    """Insert the account line directly after the alert header. Multi-account
+    mode only — legacy alerts stay byte-identical."""
+    head, sep, rest = text.partition("\n")
+    return f"{head}\nAccount: {tag}{sep}{rest}"
+
+
 # ---------------------------------------------------------------- lifecycle
 
 _WATCHER_LOCK = threading.Lock()
@@ -399,28 +564,28 @@ class _GmailHTTPError(RuntimeError):
         self.text = ""  # provider body may contain account details
 
 
-def _gmail(method, path, params=()):
+def _gmail(method, path, params=(), oauth_id="gmail"):
     url = GMAIL + path
     if params:
         url += "?" + "&".join(f"{quote(str(k), safe='')}={quote(str(v), safe='')}"
                                for k, v in params)
-    resp = credentialed_provider_request("gmail", method, url, timeout=30)
+    resp = credentialed_provider_request(oauth_id, method, url, timeout=30)
     if resp.status >= 300:
         raise _GmailHTTPError(resp.status, resp.text)
     return resp.json()
 
 
-def _bootstrap(ctx):
+def _bootstrap(ctx, oauth_id="gmail", prefix=""):
     """Record the current historyId + baseline seen set; alert nothing old."""
-    profile = _gmail("GET", "/users/me/profile")
+    profile = _gmail("GET", "/users/me/profile", oauth_id=oauth_id)
     seen = {}
     inbox = _gmail("GET", "/users/me/messages",
-                   [("q", "in:inbox"), ("maxResults", "100")])
+                   [("q", "in:inbox"), ("maxResults", "100")], oauth_id=oauth_id)
     for m in inbox.get("messages", []):
         seen[m["id"]] = int(time.time())
     state = ctx.state
-    state.set("history_id", profile["historyId"])
-    state.set("seen", seen)
+    state.set(prefix + "history_id", profile["historyId"])
+    state.set(prefix + "seen", seen)
     logger.info("inbox-sentinel bootstrapped at historyId %s (%s baseline msgs)",
                 profile["historyId"], len(seen))
 
@@ -532,8 +697,9 @@ def _extract_message_content(parsed):
     return {"body": body, "attachments": attachments, "links": _extract_links(html)}
 
 
-def _fetch_content(mid):
-    msg = _gmail("GET", f"/users/me/messages/{mid}", [("format", "raw")])
+def _fetch_content(mid, oauth_id="gmail"):
+    msg = _gmail("GET", f"/users/me/messages/{mid}", [("format", "raw")],
+                 oauth_id=oauth_id)
     raw = msg["raw"]
     if not isinstance(raw, str) or len(raw) > ((MAX_MESSAGE_BYTES + 2) // 3) * 4:
         raise ValueError("Encoded message size limit exceeded")
@@ -541,8 +707,8 @@ def _fetch_content(mid):
     return _extract_message_content(parsed)
 
 
-def _fetch_body(mid):
-    return _fetch_content(mid)["body"]
+def _fetch_body(mid, oauth_id="gmail"):
+    return _fetch_content(mid, oauth_id=oauth_id)["body"]
 
 
 # IS-ScamShield lives in modules/scamshield.py — the first first-party module
@@ -618,6 +784,10 @@ class _ModuleAPI:
         return self._state.get(key, default)
 
     def config_get(self, key, default=None):
+        # Policy modules never receive connection settings or secret fields.
+        if key in {"accounts", "client_id", "client_secret", "provider",
+                   "delivery_target", "hermes_send_path", "gmail_query"} or str(key).startswith("imap_"):
+            raise PermissionError("host-only configuration")
         return _cfg(self._ctx, key, default)
 
     def sender_matches(self, sender, rule):
@@ -677,7 +847,10 @@ async def _run_stage(ctx, stage, message):
     for name, mod in ordered:
         if stage not in mod.STAGES:
             continue
-        if not _cfg(ctx, f"module_{name}_enabled", getattr(mod, "DEFAULT_ENABLED", True)):
+        if not _module_enabled(ctx, name, mod):
+            continue
+        if not _module_scopes_ok(mod):
+            logger.warning("module %s refused: write scopes without re-consent", name)
             continue
         try:
             out = getattr(mod, stage)(message, _ModuleAPI(ctx, name, mod))
@@ -749,8 +922,12 @@ def _email_alert_text(*, subject, sender, summary, reply_to, draft,
 
 # ---------------------------------------------------------------- pipeline
 
-async def _process(ctx, mid):
-    query = str(_cfg(ctx, "gmail_query", "")).strip()
+async def _process(ctx, mid, account=None):
+    if account and not account["enabled"]:
+        return
+    oauth_id = account["oauth_id"] if account else "gmail"
+    query = (account["gmail_query"] if account
+             else str(_cfg(ctx, "gmail_query", "")).strip())
     if query:
         # Gmail history has no query filter. Check list membership first, without
         # reading unrelated headers/bodies or using any message-supplied query.
@@ -759,7 +936,7 @@ async def _process(ctx, mid):
             params = [("q", f"in:inbox ({query[:1000]})"), ("maxResults", "100")]
             if page:
                 params.append(("pageToken", page))
-            listing = _gmail("GET", "/users/me/messages", params)
+            listing = _gmail("GET", "/users/me/messages", params, oauth_id=oauth_id)
             if any(item.get("id") == mid for item in listing.get("messages", [])):
                 break
             page = listing.get("nextPageToken")
@@ -770,10 +947,12 @@ async def _process(ctx, mid):
     meta = _gmail("GET", f"/users/me/messages/{mid}",
                   [("format", "metadata")] +
                   [("metadataHeaders", h) for h in
-                   ("From", "Subject", "Reply-To", "To", "Delivered-To")])
+                   ("From", "Subject", "Reply-To", "To", "Delivered-To")],
+                  oauth_id=oauth_id)
     size = meta.get("sizeEstimate")
     if not isinstance(size, int) or isinstance(size, bool) or size < 0 or size > MAX_MESSAGE_BYTES:
-        await _resource_notice(ctx, "gmail", mid, "Message size unavailable or over limit")
+        await _resource_notice(ctx, "gmail", mid, "Message size unavailable or over limit",
+                               account=account)
         return
     headers = {x["name"]: x["value"] for x in meta["payload"]["headers"]}
     sender = headers.get("From", "")
@@ -783,7 +962,7 @@ async def _process(ctx, mid):
     label_ids = meta.get("labelIds", [])
 
     def _fetch():
-        return _fetch_content(mid)
+        return _fetch_content(mid, oauth_id=oauth_id)
 
     await _run_pipeline(
         ctx,
@@ -795,11 +974,12 @@ async def _process(ctx, mid):
         reply_to=reply_to,
         label_ids=label_ids,
         fetch_body=_fetch,
+        account=account,
     )
 
 
 async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
-                        reply_to, label_ids, fetch_body):
+                        reply_to, label_ids, fetch_body, account=None):
     """Provider-agnostic alert pipeline.
 
     ``fetch_body`` is a nullary callable (or coroutine function) returning the
@@ -807,11 +987,17 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     noise-filter / gate / draft / deliver sequence stays shared and
     byte-identical to the original Gmail path.
     """
+    if account and not account["enabled"]:
+        return
     sender = str(sender)[:300]
     subject = str(subject)[:300]
     reply_to = str(reply_to)[:300]
     message_view = {"sender": sender, "subject": subject, "recipient": recipient,
                     "label_ids": label_ids, "flags": {}, "mid": mid}
+    if account:
+        message_view.update({"account_id": account["id"],
+                             "account_label": account["label"],
+                             "account_enabled": account["enabled"]})
     for outcome in await _run_stage(ctx, "prefilter", message_view):
         if outcome.get("drop"):
             logger.info(str(outcome.get("reason", "noise (module)"))[:120])
@@ -822,7 +1008,8 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
         if asyncio.iscoroutine(content):
             content = await content
     except ValueError:
-        await _resource_notice(ctx, mid_prefix, mid, "Message exceeded parsing limits")
+        await _resource_notice(ctx, mid_prefix, mid, "Message exceeded parsing limits",
+                               account=account)
         return
     attachments = content.get("attachments", []) if isinstance(content, dict) else None
     body_raw = content.get("body", "") if isinstance(content, dict) else content
@@ -851,24 +1038,27 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
                     "; ".join(s for _, hits in force_groups for s in hits))
         summary = ""
         try:
-            gate = await _gate_call(ctx, gate_input)
+            gate = await _gate_call(ctx, gate_input, account=account)
             parsed = _validated_gate(gate)
             if parsed is not None:
                 summary = parsed.get("summary", "")
         except Exception as exc:
             logger.warning("scam summary unavailable (%s) — sending deterministic warning",
                            type(exc).__name__)
-        await _deliver(ctx, _scam_alert_text(
+        scam_text = _scam_alert_text(
             subject=subject, sender=sender, groups=force_groups, summary=summary,
-            body=body, mid_prefix=mid_prefix, mid=mid))
-        _bump_alerts_sent(ctx)
+            body=body, mid_prefix=mid_prefix, mid=mid)
+        if account:
+            scam_text = _insert_account_tag(scam_text, _safe_text(account["label"], 60))
+        await _deliver(ctx, scam_text, account=account)
+        _bump_alerts_sent(ctx, account=account)
         logger.info("scam alert delivery completed")
         return
     dropped = next((o for o in pre_gate_outcomes if o.get("drop")), None)
     if dropped:
         logger.info(str(dropped.get("reason", "dropped (module)"))[:120])
         return
-    gate = await _gate_call(ctx, gate_input)
+    gate = await _gate_call(ctx, gate_input, account=account)
     parsed = _validated_gate(gate)
     if parsed is None:
         logger.warning("gate returned unparseable output for %s — treating as noise", mid)
@@ -913,13 +1103,21 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
                                       reply_to=reply_to, draft=draft,
                                       draft_blocker=draft_blocker,
                                       mid_prefix=mid_prefix, mid=mid)
-    await _deliver(ctx, alert)
-    _bump_alerts_sent(ctx)
+    if account:
+        tag = next((o.get("account_tag") for o in post_outcomes
+                    if isinstance(o.get("account_tag"), str)), None)
+        if tag is None:
+            tag = _safe_text(account["label"], 60)  # module off/failed fallback
+        alert = _insert_account_tag(alert, tag)
+    await _deliver(ctx, alert, account=account)
+    _bump_alerts_sent(ctx, account=account)
     logger.info("alert delivery completed")
 
 
-def _gate_instructions(ctx):
-    profile = _cfg(ctx, "importance_profile", "")
+def _gate_instructions(ctx, account=None):
+    profile = str(account.get("importance_profile", "")) if account else ""
+    if not profile.strip():
+        profile = _cfg(ctx, "importance_profile", "")
     what_matters = profile.strip()[:2000] or DEFAULT_IMPORTANCE
     instructions = (
         "You are an email importance gate. Classify this email as IMPORTANT "
@@ -942,13 +1140,13 @@ def _gate_instructions(ctx):
     return instructions
 
 
-async def _gate_call(ctx, gate_input):
+async def _gate_call(ctx, gate_input, account=None):
     """One bounded importance-gate call (verdict + summary). Raises
     GateBudgetExhausted when the daily cap is spent; callers decide whether
     that defers the message (normal mail) or not (scam warnings)."""
     _reserve_gate(ctx)
     return await ctx.llm.acomplete_structured(
-        instructions=_gate_instructions(ctx),
+        instructions=_gate_instructions(ctx, account=account),
         input=[{"type": "text", "text": gate_input}],
         json_schema=GATE_SCHEMA,
         schema_name="sentinel.gate",
@@ -959,13 +1157,16 @@ async def _gate_call(ctx, gate_input):
     )
 
 
-def _bump_alerts_sent(ctx):
+def _bump_alerts_sent(ctx, account=None):
     # Delivery succeeded. A counter failure (quota, concurrent write) must NOT
     # propagate: that would make the outer tick retry the whole message and
     # re-deliver the alert.
     try:
         state = ctx.state
         state.set("alerts_sent", state.get("alerts_sent", 0) + 1)
+        if account:
+            key = f"acct_{account['id']}_alerts_sent"
+            state.set(key, state.get(key, 0) + 1)
     except Exception as exc:
         logger.warning("alerts_sent update failed (%s)", type(exc).__name__)
 
@@ -1017,8 +1218,10 @@ async def _draft_reply(ctx, sender, subject, body, *, attachments=None, body_tru
     return text.strip()[:4000] if isinstance(text, str) else None
 
 
-async def _deliver(ctx, text):
-    target = _cfg(ctx, "delivery_target", "push")
+async def _deliver(ctx, text, account=None):
+    target = (account.get("delivery_target") or "") if account else ""
+    if not target:
+        target = _cfg(ctx, "delivery_target", "push")
     if target == "none":
         return
     if target == "session":
@@ -1078,7 +1281,14 @@ async def _watch_loop(ctx):
         try:
             await _tick(ctx)
             errors = 0
-            state.set("last_error", None)
+            accounts = _accounts(ctx)
+            account_errors = [f"{a['id']}: {state.get('acct_' + a['id'] + '_last_error')}"
+                              for a in accounts if a["enabled"]
+                              and state.get('acct_' + a['id'] + '_last_error')]
+            state.set("last_error", "; ".join(account_errors) or None)
+        except AccountConfigurationError:
+            state.set("last_error", "Invalid accounts configuration; polling stopped")
+            interval = max(interval, ACCESS_RETRY_SECONDS)
         except GateBudgetExhausted:
             interval = max(interval, 3600)
             state.set("last_error", "Daily classification cap reached; pending mail deferred")
@@ -1110,6 +1320,22 @@ async def _watch_loop(ctx):
 
 
 async def _tick(ctx):
+    accounts = _accounts(ctx)
+    if _cfg(ctx, "accounts", "").strip():
+        # Multi-account: one watcher loop, N sequential connections. Disabled
+        # accounts are never polled (privacy: no header/body reads). Budgets
+        # stay global; one account's failure backs off that account only.
+        try:
+            for acct in accounts:
+                if acct["enabled"]:
+                    await _tick_account(ctx, acct)
+        finally:
+            errors = [f"{a['id']}: {ctx.state.get('acct_' + a['id'] + '_last_error')}"
+                      for a in accounts if a["enabled"]
+                      and ctx.state.get('acct_' + a['id'] + '_last_error')]
+            ctx.state.set("last_error", "; ".join(errors) or None)
+            ctx.state.set("last_poll", time.time())
+        return
     provider = _cfg(ctx, "provider", "gmail")
     if provider == "imap":
         await _load_imap_module().tick(ctx)
@@ -1117,6 +1343,59 @@ async def _tick(ctx):
     if not _gate_budget_available(ctx):
         raise GateBudgetExhausted("Daily classification cap reached; pending mail deferred")
     await _tick_gmail(ctx)
+
+
+async def _tick_account(ctx, acct):
+    """One account's poll with isolated error handling and backoff. Global
+    budget exhaustion defers ALL accounts (re-raised to the watch loop)."""
+    prefix = f"acct_{acct['id']}_"
+    state = ctx.state
+    import hashlib
+    connection = {k: acct.get(k) for k in
+                  ("provider", "oauth_id", "password_env", "imap_host", "imap_port",
+                   "imap_ssl", "imap_user", "imap_folder")}
+    binding = hashlib.sha256(json.dumps(connection, sort_keys=True).encode()).hexdigest()
+    previous = state.get(prefix + "connection_binding")
+    if previous is not None and previous != binding:
+        state.set(prefix + "last_error", "Connection changed; use a new account id")
+        return
+    state.set(prefix + "connection_binding", binding)
+    now = time.time()
+    if now < state.get(prefix + "next_retry_at", 0):
+        return
+    try:
+        if acct["provider"] == "imap":
+            await _load_imap_module().tick(ctx, account=acct)
+        else:
+            if not _gate_budget_available(ctx):
+                raise GateBudgetExhausted("Daily classification cap reached; pending mail deferred")
+            await _tick_gmail(ctx, account=acct)
+        state.set(prefix + "last_error", None)
+        state.set(prefix + "error_count", 0)
+        state.set(prefix + "next_retry_at", 0)
+    except GateBudgetExhausted:
+        state.set(prefix + "last_error", "Daily classification cap reached; pending mail deferred")
+        raise
+    except ProviderNotSignedIn:
+        state.set(prefix + "last_error", "Gmail not signed in")
+        state.set(prefix + "next_retry_at", now + ACCESS_RETRY_SECONDS)
+        logger.warning("account %s not signed in — run `hermes auth add inbox-sentinel:%s`",
+                       acct["id"], acct.get("oauth_id", "gmail"))
+        await _health_notice(ctx, "not_signed_in", account=acct)
+    except AuthError:
+        state.set(prefix + "last_error", "Gmail authentication failed")
+        state.set(prefix + "next_retry_at", now + ACCESS_RETRY_SECONDS)
+        logger.warning("account %s authentication failed", acct["id"])
+        await _health_notice(ctx, "auth_failed", account=acct)
+    except Exception as exc:
+        errors = min(state.get(prefix + "error_count", 0) + 1, 6)
+        state.set(prefix + "error_count", errors)
+        state.set(prefix + "last_error", type(exc).__name__)
+        state.set(prefix + "next_retry_at", now + min(900, 15 * 2 ** errors))
+        logger.warning("account %s tick failed (%s)", acct["id"], type(exc).__name__)
+        if errors >= FAILURE_NOTICE_AFTER:
+            await _health_notice(ctx, "repeated_failure", account=acct,
+                                 count=errors, error=type(exc).__name__)
 
 
 def _load_imap_module():
@@ -1144,17 +1423,19 @@ def _load_imap_module():
     return mod
 
 
-async def _tick_gmail(ctx):
+async def _tick_gmail(ctx, account=None):
+    prefix = f"acct_{account['id']}_" if account else ""
+    oauth_id = account["oauth_id"] if account else "gmail"
     state = ctx.state
-    if not state.get("history_id"):
-        _bootstrap(ctx)
-    seen = dict(state.get("seen", {}))
-    fails = dict(state.get("fails", {}))
-    pending = list(state.get("pending_message_ids", []))
-    pending_history_id = state.get("pending_history_id")
+    if not state.get(prefix + "history_id"):
+        _bootstrap(ctx, oauth_id=oauth_id, prefix=prefix)
+    seen = dict(state.get(prefix + "seen", {}))
+    fails = dict(state.get(prefix + "fails", {}))
+    pending = list(state.get(prefix + "pending_message_ids", []))
+    pending_history_id = state.get(prefix + "pending_history_id")
     try:
         if not pending:
-            start_history_id = state.get("history_id")
+            start_history_id = state.get(prefix + "history_id")
             page_token = None
             batch_history_id = start_history_id
             while True:
@@ -1166,13 +1447,13 @@ async def _tick_gmail(ctx):
                 if page_token:
                     params.append(("pageToken", page_token))
                 try:
-                    hist = _gmail("GET", "/users/me/history", params)
+                    hist = _gmail("GET", "/users/me/history", params, oauth_id=oauth_id)
                 except _GmailHTTPError as exc:
                     if exc.status == 404:
                         logger.warning("historyId expired (404) — re-bootstrapping on next tick")
-                        state.set("history_id", None)
-                        state.set("pending_message_ids", [])
-                        state.set("pending_history_id", None)
+                        state.set(prefix + "history_id", None)
+                        state.set(prefix + "pending_message_ids", [])
+                        state.set(prefix + "pending_history_id", None)
                         return
                     raise
                 batch_history_id = hist.get("historyId") or batch_history_id
@@ -1189,12 +1470,12 @@ async def _tick_gmail(ctx):
                     break
             if not pending:
                 if batch_history_id:
-                    state.set("history_id", batch_history_id)
-                state.set("pending_history_id", None)
+                    state.set(prefix + "history_id", batch_history_id)
+                state.set(prefix + "pending_history_id", None)
                 return
             pending_history_id = batch_history_id
-            state.set("pending_message_ids", pending)
-            state.set("pending_history_id", pending_history_id)
+            state.set(prefix + "pending_message_ids", pending)
+            state.set(prefix + "pending_history_id", pending_history_id)
         processed = 0
         while pending and processed < 20:
             if not _gate_budget_available(ctx):
@@ -1206,11 +1487,14 @@ async def _tick_gmail(ctx):
                 fails.pop(mid, None)
                 continue
             try:
-                await _process(ctx, mid)
+                if account:
+                    await _process(ctx, mid, account=account)
+                else:
+                    await _process(ctx, mid)
                 seen[mid] = int(time.time())
                 fails.pop(mid, None)
                 pending.pop(0)
-            except GateBudgetExhausted:
+            except (GateBudgetExhausted, ProviderNotSignedIn, AuthError):
                 raise
             except Exception as exc:
                 fails[mid] = fails.get(mid, 0) + 1
@@ -1220,11 +1504,15 @@ async def _tick_gmail(ctx):
                     logger.error("giving up on %s after %s attempts — marking seen",
                                  mid, fails[mid])
                     try:
-                        await _deliver(ctx, "\n".join([
+                        give_up = "\n".join([
                             "EMAIL ALERT (delivery failed after retries)",
                             "",
                             f"The watcher gave up on this message after {fails[mid]} attempts.",
-                            f"msgid: gmail:{mid}"]))
+                            f"msgid: gmail:{mid}"])
+                        if account:
+                            give_up = _insert_account_tag(
+                                give_up, _safe_text(account["label"], 60))
+                        await _deliver(ctx, give_up, account=account)
                     except Exception as exc2:
                         logger.warning("give-up notification failed (%s)", type(exc2).__name__)
                     seen[mid] = int(time.time())
@@ -1233,7 +1521,7 @@ async def _tick_gmail(ctx):
                     continue
                 break
         if not pending and pending_history_id:
-            state.set("history_id", pending_history_id)
+            state.set(prefix + "history_id", pending_history_id)
             pending_history_id = None
     finally:
         # Persist seen/fails even if the loop was interrupted — otherwise a
@@ -1242,11 +1530,11 @@ async def _tick_gmail(ctx):
         if len(seen) > SEEN_LIMIT:
             for k in sorted(seen, key=lambda item: seen[item])[:len(seen) - SEEN_LIMIT]:
                 del seen[k]
-        state.set("seen", seen)
-        state.set("fails", fails)
-        state.set("pending_message_ids", pending)
-        state.set("pending_history_id", pending_history_id)
-        state.set("last_poll", time.time())
+        state.set(prefix + "seen", seen)
+        state.set(prefix + "fails", fails)
+        state.set(prefix + "pending_message_ids", pending)
+        state.set(prefix + "pending_history_id", pending_history_id)
+        state.set(prefix + "last_poll", time.time())
 
 
 # ---------------------------------------------------------------- tools
@@ -1256,7 +1544,27 @@ def _status(ctx):
     task = _WATCHERS.get(ctx.profile_name)
     running = bool(task and not task.done()) and _cfg(ctx, "enabled", False)
     day = time.strftime("%Y-%m-%d")
+    mode = str(_cfg(ctx, "mode", "custom")).strip().lower()
+    if mode not in ("watcher", "desk_pa"):
+        mode = "custom"
+    try:
+        accounts = _accounts(ctx)
+        config_error = None
+    except AccountConfigurationError:
+        accounts = []
+        config_error = "Invalid accounts configuration; polling stopped"
     return {
+        "mode": mode,
+        "modules": {name: _module_enabled(ctx, name, mod) and _module_scopes_ok(mod)
+                    for name, mod in sorted(_modules().items())},
+        "accounts": [
+            {"id": a["id"], "label": a["label"], "provider": a["provider"],
+             "enabled": a["enabled"],
+             "last_poll": state.get(f"acct_{a['id']}_last_poll"),
+             "last_error": state.get(f"acct_{a['id']}_last_error"),
+             "alerts_sent": state.get(f"acct_{a['id']}_alerts_sent", 0)}
+            for a in accounts
+        ],
         "gate_calls_today": state.get("gate_count", 0) if state.get("gate_day") == day else 0,
         "daily_gate_cap": max(0, min(1000, int(_cfg(ctx, "daily_gate_cap", 100)))),
         "running": running,
@@ -1273,7 +1581,7 @@ def _status(ctx):
         "learned_noise_senders": len(state.get("learned_blocked_senders", {})),
         "learned_important_senders": len(state.get("learned_vip_senders", {})),
         "learned_gate_notes": len(state.get("learned_gate_notes", [])),
-        "last_error": state.get("last_error"),
+        "last_error": config_error or state.get("last_error"),
     }
 
 

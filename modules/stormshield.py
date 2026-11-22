@@ -47,7 +47,11 @@ def _storm_key(message):
         address = sender.lower()
     subject = " ".join(str(message.get("subject", "")).lower().split())[:300]
     body = str(message.get("body", ""))[:4000].encode("utf-8", "replace")
-    return f"{address}|{subject}|{hashlib.sha256(body).hexdigest()[:16]}"
+    key = f"{address}|{subject}|{hashlib.sha256(body).hexdigest()[:16]}"
+    # Account-scoped (M2): identical mail to two accounts never suppresses
+    # each other. Legacy single-account keys are unchanged.
+    account_id = message.get("account_id")
+    return f"{account_id}|{key}" if account_id else key
 
 
 def pre_gate(message, api):

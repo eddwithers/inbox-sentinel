@@ -18,7 +18,7 @@ async def pipeline(plugin, ctx, *, sender='boss@example.test', subject='Booking'
 @pytest.fixture
 def alerts(plugin, monkeypatch):
     result = []
-    async def record(ctx, text):
+    async def record(ctx, text, account=None):
         result.append(text)
     monkeypatch.setattr(plugin, '_deliver', record)
     return result

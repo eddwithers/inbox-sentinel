@@ -137,6 +137,37 @@ and does not depend on any module. If either module is disabled or fails, the
 host's proven draft/shaping path applies unchanged; the sample tool keeps the
 host draft path.
 
+## Multiple accounts and mode consent
+
+The account registry contains connection metadata and declared credential
+references, never credential values. Invalid nonblank settings stop polling;
+blank settings alone select legacy mode. Explicit [] or all-disabled entries
+poll nothing. Disabled accounts are enforced host-side even if InboxSwitch
+is disabled or broken. Unknown fields and duplicate Gmail grant mappings are
+rejected. Four Gmail declarations share readonly scopes and OAuth client
+settings but use distinct profile-owned grants; extra IMAP secrets are resolved
+only through the profile secret scope. A fixed four-account cap bounds this
+release; no dynamic manifest mutation or cross-profile credential access occurs.
+
+State is namespaced by validated account id. A stored connection fingerprint
+rejects changing that id's connection; using a new id creates a new baseline.
+The host cannot identify a mailbox silently substituted inside an OAuth grant:
+when signing a grant into a different mailbox, use a new account id too.
+Account labels are sanitised before delivery. Per-account targets are trusted
+configuration, never email- or module-controlled routing. Modules cannot read
+the registry, credentials or host connection settings through config_get.
+These first-party Python modules are not an adversarial code sandbox.
+
+Gate/draft budgets remain profile-global, including failed calls. Learned
+sender rules also remain profile-global; separate profiles are required for
+separate trust domains. Storm suppression keys include the account id.
+Per-account failure/backoff does not mark another account's mail seen.
+
+Mode presets only select shipped readonly modules. The desk_pa name is a
+preview bundle, not calendar/archive/label capability or migration of existing
+automation. Modules declaring scopes beyond gmail.readonly are refused until
+an explicit consent mechanism exists. No mailbox write scope is requested.
+
 ## Release checks
 
 Require fictional adversarial regression tests, canonical Hermes test runner,

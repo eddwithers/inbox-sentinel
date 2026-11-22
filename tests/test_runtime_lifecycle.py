@@ -39,7 +39,7 @@ _fixture_socket.socket.connect = _fixture_forbidden
 asyncio.create_subprocess_exec = _fixture_forbidden
 
 
-def _fixture_gmail(method, path, params=()):
+def _fixture_gmail(method, path, params=(), oauth_id="gmail"):
     global _fixture_metadata_attempts
     _fixture_record(path)
     if path == '/users/me/profile':

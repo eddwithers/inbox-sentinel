@@ -840,6 +840,13 @@ def test_status_reports_counts(plugin, ctx, monkeypatch):
     state.set("learned_gate_notes", ["note1", "note2", "note3"])
     out = plugin._status(ctx)
     assert out == {
+        "mode": "custom",
+        "modules": {
+            "alertshaper": True, "attachmentguard": True, "drafter": True,
+            "inboxswitch": True, "linkguard": True, "noisefilter": True,
+            "scamshield": True, "senderlearning": True, "stormshield": True,
+        },
+        "accounts": [],
         "running": False,
         "profile": "default",
         "enabled": True,
