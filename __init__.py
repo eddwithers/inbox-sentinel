@@ -636,6 +636,12 @@ class _ModuleAPI:
         routes through the host DRAFT_TASK slot with the module's purpose,
         and returns stripped text capped at 4000 chars — or None on any
         failure or over-cap. A module can never spend unbudgeted."""
+        # Parse before reserving: a bad value must never spend budget (and
+        # OverflowError from inf is a parse failure too).
+        try:
+            tokens = int(max_tokens)
+        except (TypeError, ValueError, OverflowError):
+            tokens = 700
         with _BUDGET_LOCK:
             cap = max(0, min(100, int(_cfg(self._ctx, "daily_draft_cap", 15))))
             day = time.strftime("%Y-%m-%d")
@@ -646,10 +652,6 @@ class _ModuleAPI:
                 return None
             self._state.set("budget_day", day)
             self._state.set("budget_count", count + 1)  # failed calls also consume the cap
-        try:
-            tokens = int(max_tokens)
-        except (TypeError, ValueError):
-            tokens = 700
         try:
             result = await self._ctx.llm.acomplete(
                 messages=messages,

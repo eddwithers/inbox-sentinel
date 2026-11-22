@@ -222,6 +222,18 @@ def test_seam_clamps_max_tokens(plugin, ctx):
     assert ctx.llm.complete_calls[2]["max_tokens"] == 1
 
 
+def test_seam_bad_tokens_never_double_spends(plugin, ctx):
+    """inf must clamp, not raise after reserving: one message, one budget
+    unit. A parse failure after reservation would fail the module and make
+    the host fallback reserve a second time (gate-audit finding, 22 Nov)."""
+    ctx.llm.complete_result = TextBox("ok")
+    api = plugin._ModuleAPI(ctx, "drafter", plugin._modules()["drafter"])
+    r = asyncio.run(api.llm_complete([], float("inf"), "p"))
+    assert r == "ok"
+    assert ctx.state.get("budget_count") == 1
+    assert ctx.llm.complete_calls[0]["max_tokens"] == 700
+
+
 def test_seam_budget_shared_across_modules(plugin, ctx, monkeypatch):
     _freeze_time(plugin, monkeypatch)
     ctx.config["daily_draft_cap"] = 1

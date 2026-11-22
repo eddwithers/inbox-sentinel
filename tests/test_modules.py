@@ -139,3 +139,16 @@ def test_stage_filters_by_declaration(plugin, ctx, monkeypatch):
     monkeypatch.setattr(mod, "pre_gate", lambda m, a: calls.append(1))
     asyncio.run(plugin._run_stage(ctx, "post_gate", {}))
     assert calls == []
+
+
+def test_stages_declaration_filter_is_real(plugin, ctx, monkeypatch):
+    """Pin the STAGES filter itself: give scamshield a post_gate attribute
+    it does not declare. A missing attribute would be swallowed as a module
+    failure, so only a present-but-undeclared handler detects the filter
+    (gate-audit finding, 22 Nov)."""
+    mod = plugin._modules()["scamshield"]
+    calls = []
+    monkeypatch.setattr(mod, "post_gate", lambda m, a: calls.append(1),
+                        raising=False)
+    asyncio.run(plugin._run_stage(ctx, "post_gate", {}))
+    assert calls == []
