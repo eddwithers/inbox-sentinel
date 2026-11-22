@@ -63,7 +63,7 @@ def imap_ctx(ctx):
 def capture_notifications(plugin, ctx, monkeypatch):
     ctx.delivered_messages = []
 
-    async def fake_deliver(current_ctx, text):
+    async def fake_deliver(current_ctx, text, account=None):
         current_ctx.delivered_messages.append(text)
 
     monkeypatch.setattr(plugin, "_deliver", fake_deliver)

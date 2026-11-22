@@ -59,13 +59,14 @@ def _cfg(ctx, key, default):
     return _s()._cfg(ctx, key, default)
 
 
-def _get_imap_password():
+def _get_imap_password(env_name="INBOX_SENTINEL_IMAP_PASSWORD"):
     """Resolve the IMAP password from the profile's secret scope.
 
     Catalog rule 11: plugins MUST go through ``agent.secret_scope.get_secret``
     so a multiplexing gateway serves the right profile's value (reading
     ``os.environ`` directly can leak another profile's secret). If the host
     cannot provide a secret scope, fail closed; never fall back to raw env.
+    Multi-account registries reference a declared env name per account.
     """
     try:
         from agent.secret_scope import get_secret
@@ -73,7 +74,7 @@ def _get_imap_password():
         logger.warning("imap password lookup unavailable: secret scope import failed")
         return None
     try:
-        return get_secret("INBOX_SENTINEL_IMAP_PASSWORD")
+        return get_secret(env_name)
     except Exception as exc:
         logger.warning("imap password lookup failed (%s)", type(exc).__name__)
         return None
@@ -81,23 +82,33 @@ def _get_imap_password():
 
 # ---------------------------------------------------------------- connection
 
-def _connect(ctx):
+def _connect(ctx, account=None):
     """Open, login, select — synchronous helper for direct tests."""
-    return _connect_sync(ctx)
+    return _connect_sync(ctx, account=account)
 
 
-def _connect_sync(ctx):
+def _connect_sync(ctx, account=None):
     """Open, login, select — returns the connected ``imaplib`` client.
 
     Caller owns ``logout()`` in a ``finally`` so a mid-tick exception never
-    leaks a socket or a half-authed session.
+    leaks a socket or a half-authed session. With an account, connection
+    settings and the secret env name come from the registry entry.
     """
-    host = (_cfg(ctx, "imap_host", "") or "").strip()
-    port = int(_cfg(ctx, "imap_port", 993))
-    use_ssl = bool(_cfg(ctx, "imap_ssl", True))
-    user = (_cfg(ctx, "imap_user", "") or "").strip()
-    folder = _cfg(ctx, "imap_folder", "INBOX") or "INBOX"
-    password = _get_imap_password()
+    if account:
+        host = (account.get("imap_host", "") or "").strip()
+        port = int(account.get("imap_port", 993))
+        use_ssl = bool(account.get("imap_ssl", True))
+        user = (account.get("imap_user", "") or "").strip()
+        folder = account.get("imap_folder", "INBOX") or "INBOX"
+        password = _get_imap_password(account.get("password_env",
+                                                  "INBOX_SENTINEL_IMAP_PASSWORD"))
+    else:
+        host = (_cfg(ctx, "imap_host", "") or "").strip()
+        port = int(_cfg(ctx, "imap_port", 993))
+        use_ssl = bool(_cfg(ctx, "imap_ssl", True))
+        user = (_cfg(ctx, "imap_user", "") or "").strip()
+        folder = _cfg(ctx, "imap_folder", "INBOX") or "INBOX"
+        password = _get_imap_password()
 
     if not host:
         raise RuntimeError("imap_host is not configured")
@@ -135,8 +146,8 @@ def _connect_sync(ctx):
     return client
 
 
-async def _connect_async(ctx):
-    task = asyncio.create_task(asyncio.to_thread(_connect_sync, ctx))
+async def _connect_async(ctx, account=None):
+    task = asyncio.create_task(asyncio.to_thread(_connect_sync, ctx, account))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -179,25 +190,27 @@ def _header(parsed, name, default=""):
 
 # ---------------------------------------------------------------- tick
 
-async def tick(ctx):
+async def tick(ctx, account=None):
     """One IMAP poll: connect → list new UIDs → run the shared pipeline.
 
     Exceptions bubble up to the watch loop's generic handler (``last_error``
-    is set, the loop survives, the next tick reconnects fresh).
+    is set, the loop survives, the next tick reconnects fresh). With an
+    account, all cursor state is namespaced under ``acct_<id>_``.
     """
     if not _s()._gate_budget_available(ctx):
         raise _s().GateBudgetExhausted("Daily classification cap reached; pending mail deferred")
+    prefix = f"acct_{account['id']}_" if account else ""
     state = ctx.state
-    client = await _connect_async(ctx)
+    client = await _connect_async(ctx, account=account) if account else await _connect_async(ctx)
     try:
-        last_uid = state.get("imap_last_uid")
+        last_uid = state.get(prefix + "imap_last_uid")
         current_uidvalidity = _uidvalidity(client)
-        stored_uidvalidity = state.get("imap_uidvalidity")
+        stored_uidvalidity = state.get(prefix + "imap_uidvalidity")
         if last_uid is not None and stored_uidvalidity is not None and current_uidvalidity != stored_uidvalidity:
             logger.warning("imap UIDVALIDITY changed %r -> %r — resetting cursor",
                            stored_uidvalidity, current_uidvalidity)
             last_uid = None
-            state.set("fails", {})
+            state.set(prefix + "fails", {})
         if last_uid is None:
             # Baseline: record the folder's current max UID so pre-existing
             # mail is never alerted. UID SEARCH ALL returns every UID in the
@@ -208,9 +221,9 @@ async def tick(ctx):
             raw = data[0] if data else b""
             uids = [int(x) for x in (raw.split() if raw else [])]
             baseline = max(uids) if uids else 0
-            state.set("imap_last_uid", baseline)
-            state.set("imap_uidvalidity", current_uidvalidity)
-            state.set("last_poll", time.time())
+            state.set(prefix + "imap_last_uid", baseline)
+            state.set(prefix + "imap_uidvalidity", current_uidvalidity)
+            state.set(prefix + "last_poll", time.time())
             logger.info("imap bootstrapped at uid %s (%s baseline msgs)",
                         baseline, len(uids))
             return
@@ -226,7 +239,7 @@ async def tick(ctx):
         uids = sorted(int(x) for x in (raw.split() if raw else []))
         new_uids = [u for u in uids if u > int(last_uid)]
 
-        fails = state.get("fails", {})
+        fails = state.get(prefix + "fails", {})
         high_water = int(last_uid)
         try:
             for processed, uid in enumerate(new_uids):
@@ -236,7 +249,10 @@ async def tick(ctx):
                     break
                 mid = f"imap:{uid}"
                 try:
-                    await _process_uid(ctx, client, uid)
+                    if account:
+                        await _process_uid(ctx, client, uid, account=account)
+                    else:
+                        await _process_uid(ctx, client, uid)
                     high_water = max(high_water, uid)
                     fails.pop(mid, None)
                 except _s().GateBudgetExhausted:
@@ -249,11 +265,15 @@ async def tick(ctx):
                         logger.error("giving up on %s after %s attempts — advancing cursor",
                                      mid, fails[mid])
                         try:
-                            await _s()._deliver(ctx, "\n".join([
+                            give_up = "\n".join([
                                 "EMAIL ALERT (delivery failed after retries)",
                                 "",
                                 f"The watcher gave up on this message after {fails[mid]} attempts.",
-                                f"msgid: {mid}"]))
+                                f"msgid: {mid}"])
+                            if account:
+                                give_up = _s()._insert_account_tag(
+                                    give_up, _s()._safe_text(account["label"], 60))
+                            await _s()._deliver(ctx, give_up, account=account)
                         except Exception as exc2:
                             logger.warning("imap give-up notification failed (%s)", type(exc2).__name__)
                         high_water = max(high_water, uid)
@@ -264,18 +284,19 @@ async def tick(ctx):
                         break
         finally:
             if high_water > int(last_uid):
-                state.set("imap_last_uid", high_water)
-            state.set("imap_uidvalidity", current_uidvalidity)
-            state.set("fails", fails)
-            state.set("last_poll", time.time())
+                state.set(prefix + "imap_last_uid", high_water)
+            state.set(prefix + "imap_uidvalidity", current_uidvalidity)
+            state.set(prefix + "fails", fails)
+            state.set(prefix + "last_poll", time.time())
     finally:
         await _close_client_async(client)
 
 
-async def _process_uid(ctx, client, uid):
+async def _process_uid(ctx, client, uid, account=None):
     size = await _fetch_message_size(client, uid)
     if size is None or size < 0 or size > _s().MAX_MESSAGE_BYTES:
-        await _s()._resource_notice(ctx, "imap", str(uid), _RESOURCE_REASON)
+        await _s()._resource_notice(ctx, "imap", str(uid), _RESOURCE_REASON,
+                                    account=account)
         return
 
     typ, data = await _imap_call(client.uid, "FETCH", str(uid), "(BODY.PEEK[]<0.262145>)")
@@ -283,13 +304,15 @@ async def _process_uid(ctx, client, uid):
         raise RuntimeError(f"imap FETCH {uid} failed: {typ}")
     raw_bytes = _extract_fetch_payload(data)
     if not raw_bytes or len(raw_bytes) > _s().MAX_MESSAGE_BYTES or len(raw_bytes) != size:
-        await _s()._resource_notice(ctx, "imap", str(uid), _RESOURCE_REASON)
+        await _s()._resource_notice(ctx, "imap", str(uid), _RESOURCE_REASON,
+                                    account=account)
         return
 
     try:
         parsed = _parse_rfc822(raw_bytes)
     except ValueError:
-        await _s()._resource_notice(ctx, "imap", str(uid), _RESOURCE_REASON)
+        await _s()._resource_notice(ctx, "imap", str(uid), _RESOURCE_REASON,
+                                    account=account)
         return
 
     sender = _header(parsed, "From")
@@ -310,6 +333,7 @@ async def _process_uid(ctx, client, uid):
         reply_to=reply_to,
         label_ids=[],  # IMAP has no Gmail category labels
         fetch_body=_fetch_body,
+        account=account,
     )
 
 

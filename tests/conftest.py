@@ -72,10 +72,15 @@ def plugin():
     )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    sys.modules.pop(spec.name + "._imap", None)
     spec.loader.exec_module(mod)
-    # Reset the module-level watcher registry between tests.
     mod._WATCHERS.clear()
-    return mod
+    try:
+        yield mod
+    finally:
+        sys.modules.pop(spec.name, None)
+        sys.modules.pop(spec.name + "._imap", None)
 
 
 # ---------------------------------------------------------------- ctx double
@@ -201,7 +206,7 @@ def capture_notifications(plugin, ctx, monkeypatch, request):
     if request.node.name.startswith("test_deliver"):
         return
 
-    async def record_delivery(_ctx, text):
+    async def record_delivery(_ctx, text, account=None):
         ctx.delivered_messages.append(text)
 
     monkeypatch.setattr(plugin, "_deliver", record_delivery)
@@ -219,19 +224,23 @@ class GmailStub:
         self.calls = []
         self.handlers = {}  # key -> list[dict | Exception | callable]
 
-    def respond(self, method, path_prefix, response):
-        self.handlers.setdefault((method, path_prefix), []).append(response)
+    def respond(self, method, path_prefix, response, oauth_id=None):
+        self.handlers.setdefault((method, path_prefix, oauth_id), []).append(response)
 
-    def __call__(self, method, path, params=()):
-        self.calls.append((method, path, list(params)))
-        # Find the most specific prefix match.
+    def __call__(self, method, path, params=(), oauth_id="gmail"):
+        self.calls.append((method, path, list(params), oauth_id))
+        # Find the most specific prefix match; an account-specific handler
+        # beats a wildcard one at equal prefix length.
         best = None
-        for (m, p), queue in self.handlers.items():
+        for (m, p, oid), queue in self.handlers.items():
             if m == method and path.startswith(p) and queue:
-                if best is None or len(p) > len(best[0][1]):
-                    best = ((m, p), queue)
+                if oid is not None and oid != oauth_id:
+                    continue
+                specificity = (len(p), oid is not None)
+                if best is None or specificity > best[0]:
+                    best = (specificity, queue)
         if best is None:
-            raise AssertionError(f"GmailStub: unexpected call {method} {path}")
+            raise AssertionError(f"GmailStub: unexpected call {method} {path} ({oauth_id})")
         queue = best[1]
         item = queue.pop(0)
         if isinstance(item, Exception):

@@ -166,6 +166,9 @@ labels, archives or deletes your mail.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Run the watcher (turn on after setup) |
+| `accounts` | *(blank)* | JSON registry; blank = legacy, [] = none; up to four accounts |
+| `mode` | `custom` | `watcher`, read-only `desk_pa` preview, or per-toggle `custom` |
+| `module_inboxswitch_enabled` | `true` | Account-tag policy; host retains connection/disabled-account enforcement |
 | `provider` | `gmail` | `gmail` (OAuth history API) or `imap` (generic poll) |
 | `gmail_query` | *(empty)* | Optional Gmail search scope checked before message metadata/body/model access; use a narrow label or subject query |
 | `imap_host` | *(empty)* | IMAP server hostname (provider=imap) |
@@ -193,6 +196,73 @@ labels, archives or deletes your mail.
 | `quiet_labels` | promotions, social | Gmail labels skipped before any model call (ignored for IMAP) |
 | `keyword_overrides` | appointment, invoice, ... | Subject words that override the quiet labels |
 | `skip_recipient_keywords` | *(empty)* | Recipient substrings to ignore (old aliases) |
+
+### Multiple accounts and mode presets
+
+IS-InboxSwitch adds **up to four configured accounts per Hermes profile**.
+This release uses a fixed, manifest-declared credential pool; it does not
+support unlimited dynamic OAuth grants. Keep accounts in their owning
+profile: no credentials or state are read from another profile.
+
+Leave `accounts` blank for the existing single-account settings and unchanged
+alert text. Otherwise enter a JSON list, for example:
+
+```json
+[
+  {"id":"primary","label":"Primary","provider":"gmail","oauth_id":"gmail"},
+  {"id":"secondary","label":"Secondary","provider":"gmail","oauth_id":"gmail2",
+   "importance_profile":"Only direct requests needing a decision","enabled":true}
+]
+```
+
+Sign in separately in the owning profile with
+`hermes auth add inbox-sentinel:gmail` and
+`hermes auth add inbox-sentinel:gmail2` (also `gmail3`, `gmail4`). These share
+the configured OAuth client, **not a grant**. The existing `gmail` declaration
+is unchanged. Adding the other declarations expands the disclosed sign-in
+surface without adding write scopes. Google Testing-mode expiry applies to
+each grant. Confirm the correct mailbox in each consent flow. Two entries
+cannot use the same grant id. If re-authorising a grant for a different
+mailbox, also use a **new account id** to establish a fresh cursor.
+
+For IMAP, an entry uses `provider: "imap"`, `imap_host`, `imap_port`,
+`imap_ssl`, `imap_user`, `imap_folder`, and `password_env` (one of
+`INBOX_SENTINEL_IMAP_PASSWORD`, `INBOX_SENTINEL_IMAP_PASSWORD2`, `...3`, `...4`).
+Store passwords through the masked host secret settings, never in this JSON.
+Omitted IMAP connection fields use the legacy global settings. TLS and
+read-only selection remain mandatory except literal-loopback test servers.
+
+Optional per-account `gmail_query`, `importance_profile` and `delivery_target`
+control message scope, classification and notification routing. An empty
+importance profile or delivery target inherits the global value; an empty
+per-account Gmail query means the whole inbox, not the global query.
+`enabled: false` prevents all polling of that account. `[]` watches none.
+**Invalid nonblank configuration stops polling**, rather than selecting a
+legacy mailbox. Check `inbox_sentinel_status` for the error. Connection changes
+under an existing id are refused; use a new id. There is no automatic migration
+of legacy cursors: new ids baseline existing mail without alerting it.
+
+Multi-account alerts add `Account: <label>` after the header; existing message
+id footers remain unchanged. Cursors, retries and health notices are isolated;
+storm keys include the account id. Learned sender preferences remain shared
+within the profile. Gate/draft budgets are also shared, not multiplied by the
+number of accounts. Polling is sequential, so a slow server can delay later
+accounts; failure/backoff is per account. Account order determines budget
+priority. This release does not provide scheduling fairness.
+
+| `mode` | Effective modules |
+| --- | --- |
+| `custom` (default) | Individual module toggles; preserves existing behaviour |
+| `watcher` | ScamShield, NoiseFilter, SenderLearning, Drafter, AlertShaper, InboxSwitch; the other three guards off |
+| `desk_pa` | All shipped read-only modules on |
+
+Presets override toggles; use `custom` to fine-tune. **`desk_pa` is a read-only
+preview bundle, not Desk PA parity.** Calendar changes, archive, labels and
+other mailbox writes remain deferred and require an explicit consent design.
+No existing Desk PA automation is replaced. `draft_replies: false` still
+prevents drafts in every mode. IS-InboxSwitch's toggle controls its stage
+policy; host-owned connections and disabled-account enforcement remain active,
+and a disabled/failed tag module falls back to host tagging.
 
 ### Choosing the models
 

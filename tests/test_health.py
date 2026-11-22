@@ -101,7 +101,7 @@ def test_a_success_resets_the_failure_count(health, monkeypatch):
 def test_failed_notice_delivery_does_not_stop_the_loop(plugin, ctx, monkeypatch):
     attempts = []
 
-    async def failing_delivery(_ctx, text):
+    async def failing_delivery(_ctx, text, account=None):
         attempts.append(text)
         raise RuntimeError("delivery unavailable")
 
