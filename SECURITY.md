@@ -109,10 +109,14 @@ password-protected bank statements) are expected; the warning re-labels mail,
 it never suppresses it.
 
 The check runs as a first-party module (`modules/scamshield.py`) behind a
-host-enforced boundary: modules receive namespaced state only — no transport,
-credentials, model calls or delivery. A failing or disabled module degrades to
-host-default behaviour and never crashes the poll loop. Third-party module
-loading is deliberately not supported.
+host-enforced boundary: modules receive a bounded API — namespaced state,
+declared shared-state reads, trusted config reads and pure host helpers. No
+transport, credentials, delivery or raw `ctx.llm`: model calls go through the
+host's budgeted seam only (`llm_complete`), which reserves the same daily
+draft cap as the host draft path, counts failed calls, and returns nothing
+over cap — a module can never spend unbudgeted. A failing or disabled module
+degrades to host-default behaviour and never crashes the poll loop.
+Third-party module loading is deliberately not supported.
 
 IS-AttachmentGuard and IS-LinkGuard extend the same warning path with
 deterministic attachment-metadata and URL heuristics: attachment contents are
@@ -122,6 +126,16 @@ identical-repeat alert storms (same sender, subject and body hash within a
 configurable window); first arrivals always alert, transport retries never
 count, different bodies never suppress each other, and security warnings
 outrank suppression. Storm state is namespaced and bounded.
+
+IS-Drafter and IS-AlertShaper run on the post_gate stage. The drafter's model
+requests go through the budgeted seam above (one shared daily draft cap with
+the host fallback path; exhaustion yields summary-only alerts, never a
+bypass). The alert shaper is first-party code, but every untrusted field it
+renders still passes the host's sanitisation helper, and its output is pinned
+byte-identical to the host fallback. POSSIBLE SCAM shaping stays host-owned
+and does not depend on any module. If either module is disabled or fails, the
+host's proven draft/shaping path applies unchanged; the sample tool keeps the
+host draft path.
 
 ## Release checks
 

@@ -186,6 +186,8 @@ labels, archives or deletes your mail.
 | `module_attachmentguard_enabled` | `true` | IS-AttachmentGuard module — attachment-risk warnings |
 | `module_linkguard_enabled` | `true` | IS-LinkGuard module — suspicious-URL warnings |
 | `module_stormshield_enabled` | `true` | IS-StormShield module — identical-repeat storm suppression |
+| `module_drafter_enabled` | `true` | IS-Drafter module — post_gate draft policy through the host's budgeted model seam |
+| `module_alertshaper_enabled` | `true` | IS-AlertShaper module — EMAIL ALERT shaping, byte-identical to the host fallback |
 | `storm_window_minutes` | `30` | IS-StormShield window for counting identical repeats |
 | `storm_threshold` | `3` | Identical arrivals within the window before repeats suppress |
 | `quiet_labels` | promotions, social | Gmail labels skipped before any model call (ignored for IMAP) |
@@ -257,9 +259,10 @@ shapes — not a general phishing detector or a guarantee of safety.
 
 IS-ScamShield is the first module of Sentinel's modular platform: it ships in
 `modules/scamshield.py` and toggles with `module_scamshield_enabled`. Modules
-receive namespaced state only — transport, model budgets, alert shaping,
-delivery and the read-only contract stay host-owned, and a failing or disabled
-module degrades to host-default behaviour.
+receive a bounded API — namespaced state, declared shared reads, config reads
+and pure helpers. Transport, credentials, delivery and the read-only contract
+stay host-owned; model calls are available only through the host's budgeted
+seam, and a failing or disabled module degrades to host-default behaviour.
 
 ### IS-AttachmentGuard
 
@@ -301,6 +304,27 @@ suppressed (default: the 3rd identical arrival within 30 minutes; tune
   degrades to defaults rather than misfiring.
 
 Toggle: `module_stormshield_enabled`.
+
+### IS-Drafter
+
+Reply-draft policy as a post_gate module. The deterministic withhold rules
+(attachments present or referenced, truncated or empty bodies) and the
+`draft_replies` switch move into `modules/drafter.py`; drafts are requested
+through the host's budgeted model seam — the same daily draft cap as the host
+path, failed calls counting against it, over-cap returning a summary-only
+alert. The module never sees `ctx.llm`, transport, credentials or delivery.
+"NO REPLY NEEDED" still passes through to the host for interpretation.
+Toggle: `module_drafter_enabled`. Off or failing → the host's own draft path
+applies, behaviour-identical.
+
+### IS-AlertShaper
+
+Shapes the normal EMAIL ALERT text as a post_gate module — byte-identical to
+the host's own shaping (pinned by tests), with untrusted fields sanitised
+through the host's `safe_text` helper. The POSSIBLE SCAM warning path stays
+host-owned: security shaping never depends on a module being enabled or
+healthy. Toggle: `module_alertshaper_enabled`. Off or failing → host shaping
+applies, behaviour-identical.
 
 ### Runtime verification
 

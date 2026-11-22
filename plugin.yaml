@@ -172,6 +172,21 @@ config_schema:
     description: >-
       IS-StormShield module — suppress identical-repeat alert storms; first
       arrivals always alert and security warnings are never suppressed
+  module_drafter_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-Drafter module — reply-draft policy on the post_gate stage:
+      deterministic withholds (attachments, incomplete bodies) and drafts
+      through the host's budgeted model seam. Off = the host's own draft
+      path applies unchanged
+  module_alertshaper_enabled:
+    type: bool
+    default: true
+    description: >-
+      IS-AlertShaper module — shapes the normal EMAIL ALERT text
+      (byte-identical to the host fallback). Off or failing = host shaping
+      applies; POSSIBLE SCAM warnings are always host-shaped
   storm_window_minutes:
     type: int
     default: 30

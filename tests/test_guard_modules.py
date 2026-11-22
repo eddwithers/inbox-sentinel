@@ -267,7 +267,7 @@ def test_storm_disabled(plugin, ctx, monkeypatch):
     msg = {"sender": "Blast <blast@shop.test>", "subject": "Sale", "body": "Same"}
     view = dict(msg, flags={})
     for _ in range(10):
-        assert not any(o.get("drop") for o in plugin._run_stage(ctx, "pre_gate", view))
+        assert not any(o.get("drop") for o in asyncio.run(plugin._run_stage(ctx, "pre_gate", view)))
 
 
 # ---------------------------------------------------------------- pipeline integration
