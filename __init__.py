@@ -595,9 +595,9 @@ def _modules():
 
 class _ModuleAPI:
     """Bounded module surface. Namespaced state, declared shared-state reads,
-    trusted local config reads, and pure host helpers. No transport, no
-    credentials, no model calls, no delivery — those stay host-owned and grow
-    only when a module genuinely needs them."""
+    trusted local config reads, pure host helpers, and a budgeted model seam
+    (llm_complete). No transport, no credentials, no delivery, and no raw
+    ctx.llm — model calls go through the host draft budget only."""
 
     def __init__(self, ctx, name, module=None):
         self._ctx = ctx
@@ -623,11 +623,52 @@ class _ModuleAPI:
     def sender_matches(self, sender, rule):
         return _sender_matches(sender, rule)
 
+    def safe_text(self, value, limit=1200, *, multiline=False):
+        return _safe_text(value, limit, multiline=multiline)
 
-def _run_stage(ctx, stage, message):
+    def draft_blocker(self, subject, body, *, attachments=None, body_truncated=False):
+        return _draft_blocker(subject, body, attachments=attachments,
+                              body_truncated=body_truncated)
+
+    async def llm_complete(self, messages, max_tokens, purpose):
+        """Budgeted model seam (M1b). Reserves the host draft budget exactly
+        as _draft_reply does (daily cap, failed calls count, day rollover),
+        routes through the host DRAFT_TASK slot with the module's purpose,
+        and returns stripped text capped at 4000 chars — or None on any
+        failure or over-cap. A module can never spend unbudgeted."""
+        with _BUDGET_LOCK:
+            cap = max(0, min(100, int(_cfg(self._ctx, "daily_draft_cap", 15))))
+            day = time.strftime("%Y-%m-%d")
+            count = (self._state.get("budget_count", 0)
+                     if self._state.get("budget_day") == day else 0)
+            if count >= cap:
+                logger.warning("daily draft attempt cap reached — module request deferred")
+                return None
+            self._state.set("budget_day", day)
+            self._state.set("budget_count", count + 1)  # failed calls also consume the cap
+        try:
+            tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            tokens = 700
+        try:
+            result = await self._ctx.llm.acomplete(
+                messages=messages,
+                max_tokens=max(1, min(1000, tokens)),
+                temperature=0.3,
+                purpose=str(purpose)[:120] or DRAFT_PURPOSE,
+                task=DRAFT_TASK,
+            )
+        except Exception as exc:
+            logger.warning("module model call failed (%s)", type(exc).__name__)
+            return None
+        text = getattr(result, "text", None)
+        return text.strip()[:4000] if isinstance(text, str) else None
+
+
+async def _run_stage(ctx, stage, message):
     """Run enabled module handlers for a stage in priority order and collect
-    dict outcomes. Module failure degrades to host-default behaviour, never
-    raises."""
+    dict outcomes. Handlers may be sync or async (M1b). Module failure
+    degrades to host-default behaviour, never raises."""
     outcomes = []
     ordered = sorted(_modules().items(),
                      key=lambda kv: (getattr(kv[1], "PRIORITY", 100), kv[0]))
@@ -638,6 +679,8 @@ def _run_stage(ctx, stage, message):
             continue
         try:
             out = getattr(mod, stage)(message, _ModuleAPI(ctx, name, mod))
+            if asyncio.iscoroutine(out):
+                out = await out
         except Exception as exc:
             logger.warning("module %s failed at %s (%s) — host default applies",
                            name, stage, type(exc).__name__)
@@ -678,6 +721,27 @@ def _scam_alert_text(*, subject, sender, groups, summary="", body="",
     ]
     if mid_prefix and mid is not None:
         lines += ["", f"msgid: {mid_prefix}:{mid}"]
+    return "\n".join(lines)
+
+
+def _email_alert_text(*, subject, sender, summary, reply_to, draft,
+                      draft_blocker, mid_prefix, mid):
+    """Shape the normal EMAIL ALERT. Pure string building; delivery stays
+    with the caller. This is the host degradation path — IS-AlertShaper's
+    output must stay byte-identical to it (pinned by tests)."""
+    lines = ["EMAIL ALERT", "",
+             f"Subject: {_safe_text(subject, 300)}",
+             f"From: {_safe_text(sender, 300)}",
+             f"Time: {time.strftime('%H:%M')}", "", _safe_text(summary), ""]
+    if draft_blocker:
+        lines += [f"No reply drafted — {draft_blocker} Please review the original email."]
+    elif draft and "NO REPLY NEEDED" not in draft.upper():
+        lines += [f"Suggested reply (to {_safe_text(reply_to, 300)}):", "```", _safe_text(draft, 4000, multiline=True), "```"]
+    elif draft:
+        lines += ["No reply needed — flagged for your awareness."]
+    else:
+        lines += ["No reply drafted — draft generation unavailable or disabled; review the email."]
+    lines += ["", f"msgid: {mid_prefix}:{mid}"]
     return "\n".join(lines)
 
 
@@ -746,7 +810,7 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     reply_to = str(reply_to)[:300]
     message_view = {"sender": sender, "subject": subject, "recipient": recipient,
                     "label_ids": label_ids, "flags": {}, "mid": mid}
-    for outcome in _run_stage(ctx, "prefilter", message_view):
+    for outcome in await _run_stage(ctx, "prefilter", message_view):
         if outcome.get("drop"):
             logger.info(str(outcome.get("reason", "noise (module)"))[:120])
             return
@@ -771,7 +835,7 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
         gate_input += f"\n\n[Reader limitation: {draft_blocker} {context_note}]"
     message_view.update({"body": body, "attachments": attachments,
                          "links": content.get("links", []) if isinstance(content, dict) else []})
-    pre_gate_outcomes = _run_stage(ctx, "pre_gate", message_view)
+    pre_gate_outcomes = await _run_stage(ctx, "pre_gate", message_view)
     force_groups = [(str(o.get("brand", "IS-ScamShield"))[:60], o.get("signals", []))
                     for o in pre_gate_outcomes if o.get("force_alert")]
     if force_groups:
@@ -811,30 +875,43 @@ async def _run_pipeline(ctx, *, mid_prefix, mid, sender, subject, recipient,
     summary = parsed.get("summary", "")
     message_view["verdict"] = verdict
     if verdict == "NOISE" and any(o.get("force_important")
-                                  for o in _run_stage(ctx, "gate", message_view)):
+                                  for o in await _run_stage(ctx, "gate", message_view)):
         logger.info("gate overruled by exact sender preference (not authenticated identity)")
         verdict = "IMPORTANT"
     if verdict == "NOISE":
         logger.info("noise (gate)")
         return
 
-    draft = await _draft_reply(ctx, sender, subject, body, attachments=attachments,
-                               body_truncated=body_truncated)
-
-    lines = ["EMAIL ALERT", "",
-             f"Subject: {_safe_text(subject, 300)}",
-             f"From: {_safe_text(sender, 300)}",
-             f"Time: {time.strftime('%H:%M')}", "", _safe_text(summary), ""]
-    if draft_blocker:
-        lines += [f"No reply drafted — {draft_blocker} Please review the original email."]
-    elif draft and "NO REPLY NEEDED" not in draft.upper():
-        lines += [f"Suggested reply (to {_safe_text(reply_to, 300)}):", "```", _safe_text(draft, 4000, multiline=True), "```"]
-    elif draft:
-        lines += ["No reply needed — flagged for your awareness."]
+    # post_gate: IS-Drafter (budgeted seam) then IS-AlertShaper. The view
+    # carries the host-computed blocker (full body, pre-truncation) so the
+    # module can never miss a withhold reason the host already established.
+    message_view.update({"summary": summary, "draft_blocker": draft_blocker,
+                         "body_truncated": body_truncated, "reply_to": reply_to,
+                         "mid_prefix": mid_prefix})
+    post_outcomes = await _run_stage(ctx, "post_gate", message_view)
+    drafter_out = next((o for o in post_outcomes if "draft" in o), None)
+    if drafter_out is None:
+        # Drafter disabled/failed: the host's proven draft + shaping path,
+        # behaviour-identical to pre-module releases.
+        draft = await _draft_reply(ctx, sender, subject, body,
+                                   attachments=attachments,
+                                   body_truncated=body_truncated)
+        alert = _email_alert_text(subject=subject, sender=sender, summary=summary,
+                                  reply_to=reply_to, draft=draft,
+                                  draft_blocker=draft_blocker,
+                                  mid_prefix=mid_prefix, mid=mid)
     else:
-        lines += ["No reply drafted — draft generation unavailable or disabled; review the email."]
-    lines += ["", f"msgid: {mid_prefix}:{mid}"]
-    await _deliver(ctx, "\n".join(lines))
+        draft = drafter_out.get("draft")
+        shaper_out = next((o for o in post_outcomes
+                           if isinstance(o.get("alert_text"), str)), None)
+        if shaper_out is not None:
+            alert = shaper_out["alert_text"]
+        else:
+            alert = _email_alert_text(subject=subject, sender=sender, summary=summary,
+                                      reply_to=reply_to, draft=draft,
+                                      draft_blocker=draft_blocker,
+                                      mid_prefix=mid_prefix, mid=mid)
+    await _deliver(ctx, alert)
     _bump_alerts_sent(ctx)
     logger.info("alert delivery completed")
 
@@ -1259,7 +1336,7 @@ async def _test(ctx, args):
     subject = str(args.get("subject", "Test message"))[:300]
     body = str(args.get("body", ""))[:MAX_MESSAGE_BYTES]
     gate_input = f"From: {sender}\nSubject: {subject}\n\n{body[:3000]}"
-    pre_gate_outcomes = _run_stage(ctx, "pre_gate", {
+    pre_gate_outcomes = await _run_stage(ctx, "pre_gate", {
         "sender": sender, "subject": subject, "body": body, "recipient": "",
         "attachments": None, "label_ids": [], "links": [], "flags": {}})
     force_groups = [(str(o.get("brand", "IS-ScamShield"))[:60], o.get("signals", []))

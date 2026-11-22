@@ -43,7 +43,7 @@ def test_prefilter_runs_in_priority_order(plugin, ctx, monkeypatch):
         mod = plugin._modules()[name]
         monkeypatch.setattr(mod, "prefilter",
                             lambda m, a, n=name: order.append(n))
-    plugin._run_stage(ctx, "prefilter", {"sender": "x@example.test"})
+    asyncio.run(plugin._run_stage(ctx, "prefilter", {"sender": "x@example.test"}))
     assert order == ["senderlearning", "noisefilter"]
 
 
@@ -101,14 +101,14 @@ def test_flags_flow_from_prefilter_to_gate_stage(plugin, ctx):
     ctx.state.set("learned_vip_senders", {"alice@example.test": 1})
     view = {"sender": "Alice <alice@example.test>", "subject": "Hi",
             "recipient": "me@example.test", "label_ids": [], "flags": {}}
-    for outcome in plugin._run_stage(ctx, "prefilter", view):
+    for outcome in asyncio.run(plugin._run_stage(ctx, "prefilter", view)):
         flags = outcome.get("flags")
         if isinstance(flags, dict):
             view["flags"].update(flags)
     assert view["flags"].get("vip") is True
     view["verdict"] = "NOISE"
     assert any(o.get("force_important")
-               for o in plugin._run_stage(ctx, "gate", view))
+               for o in asyncio.run(plugin._run_stage(ctx, "gate", view)))
 
 
 # ---------------------------------------------------------------- bounded API

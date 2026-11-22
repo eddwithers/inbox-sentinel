@@ -85,7 +85,7 @@ def test_disabled_module_handler_is_not_called(plugin, ctx, monkeypatch):
     calls = []
     mod = plugin._modules()["scamshield"]
     monkeypatch.setattr(mod, "pre_gate", lambda m, a: calls.append(1))
-    assert plugin._run_stage(ctx, "pre_gate", {}) == []
+    assert asyncio.run(plugin._run_stage(ctx, "pre_gate", {})) == []
     assert calls == []
 
 
@@ -113,7 +113,7 @@ def test_module_state_is_namespaced(plugin, ctx):
 def test_non_dict_outcomes_are_ignored(plugin, ctx, monkeypatch):
     mod = plugin._modules()["scamshield"]
     monkeypatch.setattr(mod, "pre_gate", lambda m, a: "not a dict")
-    assert plugin._run_stage(ctx, "pre_gate", {}) == []
+    assert asyncio.run(plugin._run_stage(ctx, "pre_gate", {})) == []
 
 
 def test_failing_module_degrades_to_host_default(plugin, ctx, gmail, monkeypatch):
@@ -129,6 +129,13 @@ def test_failing_module_degrades_to_host_default(plugin, ctx, gmail, monkeypatch
     assert ctx.delivered_messages == []  # host default: gate decides
 
 
-def test_stage_filters_by_declaration(plugin, ctx):
-    # scamshield declares only pre_gate; it must not run at other stages.
-    assert plugin._run_stage(ctx, "post_gate", {}) == []
+def test_stage_filters_by_declaration(plugin, ctx, monkeypatch):
+    # Host-only stages run no modules at all.
+    assert asyncio.run(plugin._run_stage(ctx, "deliver", {})) == []
+    # scamshield declares only pre_gate; it must not run at post_gate
+    # (which now has its own declared modules).
+    calls = []
+    mod = plugin._modules()["scamshield"]
+    monkeypatch.setattr(mod, "pre_gate", lambda m, a: calls.append(1))
+    asyncio.run(plugin._run_stage(ctx, "post_gate", {}))
+    assert calls == []
