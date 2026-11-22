@@ -175,7 +175,13 @@ def test_hosted_watcher_start_retry_disable_resume_and_unload(runtime):
     assert first_poll is not None
     _start(manager)
     assert _state(home)['started_at'] == first_start
-    _wait(lambda: 'fixture' in _state(home).get('seen', {}), 'automatic retry on next poll')
+    # seen and fails are two separate atomic state writes in _tick_gmail's
+    # finally; wait for BOTH to settle before asserting (a read between the
+    # writes can see stale fails). The contract is eventual consistency of
+    # the pair, not simultaneity.
+    _wait(lambda: 'fixture' in _state(home).get('seen', {})
+          and _state(home).get('fails', {}) == {},
+          'automatic retry on next poll (seen and fails persisted)')
     assert _events(events).count('/users/me/messages/fixture') == 2
     assert _state(home).get('fails', {}) == {}
 
